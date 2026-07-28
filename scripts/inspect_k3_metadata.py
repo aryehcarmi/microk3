@@ -7,19 +7,29 @@ WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
 
 
 def main() -> None:
-    files = HfApi().list_repo_files(REPO)
+    files = HfApi().list_repo_files(repo_id=REPO, repo_type="model")
     print(f"{REPO}: {len(files)} remote files (metadata only)\n")
     total = 0
+    weight_count = 0
+    unknown_sizes = []
     for name in files:
         if name.endswith(WEIGHT_SUFFIXES):
             metadata = get_hf_file_metadata(hf_hub_url(REPO, name))  # HEAD request, no body
-            size = metadata.size or 0
+            weight_count += 1
+            if metadata.size is None:
+                unknown_sizes.append(name)
+                print(f"WEIGHT  {'unknown':>8}      {name}")
+                continue
+            size = metadata.size
             total += size
             print(f"WEIGHT  {size / 2**30:8.2f} GiB  {name}")
         else:
             print(f"CONTROL {'—':>8}      {name}")
-    print(f"\nRemote weight total from HEAD metadata: {total / 2**40:.3f} TiB")
-    print("Downloaded: 0 bytes. This script has no download call.")
+    print(f"\nRecognized weight files: {weight_count}")
+    print(f"Known remote weight total from HEAD metadata: {total / 2**40:.3f} TiB")
+    if unknown_sizes:
+        print(f"Files with unknown sizes: {len(unknown_sizes)}")
+    print("Downloaded file bodies: 0 bytes. This script has no file-download call.")
 
 
 if __name__ == "__main__":

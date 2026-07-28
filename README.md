@@ -4,82 +4,133 @@
   <p>
     <a href="#five-minute-tour">Five-minute tour</a> ·
     <a href="#what-is-faithful">Honesty map</a> ·
+    <a href="#report-to-code-map">Report → code</a> ·
     <a href="#modal">Modal</a> ·
-    <a href="docs/report-notes.md">Report notes</a>
+    <a href="docs/report-notes.md">Source notes</a>
+  </p>
+  <p>
+    <a href="https://github.com/aryehcarmi/microk3/actions/workflows/ci.yml">
+      <img src="https://github.com/aryehcarmi/microk3/actions/workflows/ci.yml/badge.svg" alt="CI status">
+    </a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> **microK3 is K3-inspired, not Kimi K3.** It is a ~2M parameter teaching model, not a
-> reproduction or distillation. It never downloads the 2.8T-parameter weights. The goal is
-> the Karpathy-style feeling of seeing the whole learning system—not benchmark parity.
+> **microK3 is K3-inspired, not Kimi K3.** It is a ~1.96M-parameter teaching model, not a
+> reproduction or distillation. It never downloads the 2.8T-parameter weights. The goal is the
+> Karpathy-style feeling of seeing the whole learning system—not benchmark parity.
 
 ## Why this exists
 
 Kimi K3 combines several beautiful ideas: recurrent **Kimi Delta Attention**, periodic global
 attention, **Attention Residuals** across depth, and a **Stable LatentMoE** across width. The
-official implementation needs industrial infrastructure. This repo turns the conceptual spine
-into one hackable file, one diagram, and three tests.
+official implementation needs industrial infrastructure. This repository turns the conceptual
+spine into one hackable file, one diagram, and a small regression suite.
 
-![Architecture map](assets/architecture.svg)
+![Diagram of sequence, depth, and width information flow in microK3](assets/architecture.svg)
 
 ## Five-minute tour
 
 ```bash
-git clone https://github.com/aryehcarmi/microk3 && cd microk3
-python -m venv .venv && source .venv/bin/activate
+git clone https://github.com/aryehcarmi/microk3
+cd microk3
+python -m venv .venv
+source .venv/bin/activate
 pip install -e '.[dev]'
-python microk3.py --steps 100
+pytest -q
+microk3 --steps 20
 ```
 
-Bring any text or code corpus (it is read as raw bytes, so there is no tokenizer setup):
+The test run should report `18 passed`. The first training loss should be near the uniform
+byte-token baseline `ln(256) ≈ 5.55`; an initial loss in the tens or hundreds is a bug, not a
+learning challenge.
+
+Bring a text, code, or arbitrary byte corpus:
 
 ```bash
-python microk3.py --data path/to/tiny.txt --steps 1000
+microk3 --data path/to/tiny.txt --steps 1000
 ```
+
+The file must contain at least `block_size + 1` bytes—129 bytes at the default setting, though a
+larger corpus is much more useful. Use `--block-size 64` for a faster CPU experiment. Training
+prints a sample at the end; it intentionally does not create a checkpoint or background job.
+Use `--generate 0` for a train-only run. Run `microk3 --help` to see the batch size, learning rate,
+prompt, temperature, and device controls.
 
 Read [`microk3.py`](microk3.py) top to bottom. The suggested path is:
 
-1. `KimiDeltaAttention`: a legible recurrent delta update; bounded decay prevents forgetting
-   factors from becoming arbitrarily small.
-2. `GatedAttention`: periodic causal global attention. K3 uses compressed MLA; we deliberately
-   use ordinary attention so the lesson fits on one screen.
-3. `SiTUGLU` → `StableLatentMoE`: project into a small latent, route to top-k specialists, normalize,
-   then project back. The bounded activation is directly from the report.
-4. `MicroK3.forward`: each layer softly retrieves earlier depth states, a compact teaching version
-   of AttnRes.
+1. `KimiDeltaAttention`: Eq. 1 as a legible recurrent token loop, including channel-wise decay
+   before the delta correction; Eq. 5 supplies the bounded log-decay.
+2. `GatedAttention`: periodic causal global attention. K3 uses compressed MLA; microK3 uses
+   ordinary attention so the lesson fits on one screen.
+3. `SiTUGLU` → `StableLatentMoE`: route through a small latent, normalize the routed aggregate,
+   and update dispatch biases with an exact batch-local version of Quantile Balancing.
+4. `MicroK3._mix_depth`: full AttnRes-style retrieval over the embedding and individual layer
+   contributions, with a separate final-output query.
 
 ## What is faithful?
 
 | Idea | Kimi K3 | microK3 | Status |
-|---|---:|---:|---|
-| Hybrid schedule | 69 KDA + 24 Gated MLA | 3 KDA : 1 global attention | 🟢 pattern |
-| Lower-bounded decay | `g_min = -5` | `exp(-5 sigmoid(.))` | 🟢 equation |
+|---|---|---|---|
+| Hybrid schedule | 69 KDA + 24 Gated MLA; 3:1 blocks plus final global layer | 3 KDA + 1 global by default; arbitrary depths still end globally | 🟢 pattern |
+| Delta recurrence | Channel-wise decay, then delta correction | Same recurrence in a readable token loop | 🟢 equation |
+| KDA projections | ShortConv + Swish Q/K/V; low-rank decay logits | Plain linear Q/K/V; full-rank decay logits | 🟡 simplified |
+| Lower-bounded decay | `g = -5 sigmoid(exp(A) z)` per key channel | Same mapping, per key channel | 🟢 equation |
+| KDA execution | Fused chunkwise kernel | Sequential Python loop | 🟡 equivalent recurrence, slow execution |
+| Global attention | Gated MLA, NoPE | Gated MHA, no positional embeddings | 🟡 substituted |
+| Attention Residuals | Eight block-level groups with partial sums | Full attention over every layer contribution | 🟡 small-scale form |
+| Stable LatentMoE | 896 routed, top-16, 2 shared, latent width 3,584 | 8 routed, top-2, 1 shared, latent width 64 | 🟡 scaled down |
+| Quantile Balancing | Global histogram estimate, applied next batch | Exact local-batch quantile, applied next forward | 🟡 scaled down |
 | SiTU-GLU | β₁=4, β₂=25 | β₁=4, β₂=25 | 🟢 equation |
-| Latent MoE | 896 experts, top-16, 2 shared | 8, top-2, 1 shared | 🟡 scaled down |
-| Attention Residuals | 8 depth blocks | all earlier layer outputs | 🟡 simplified |
-| Global attention | Gated MLA, NoPE | gated MHA, NoPE | 🟡 substituted |
-| KDA kernel | chunkwise fused algorithm | equivalent-style token loop | 🟡 pedagogical |
-| Vision / million context / QAT | native, production scale | absent | ⚪ out of scope |
+| Context and tokens | 1,048,576 learned-token context | 128 raw bytes by default | 🟡 teaching scale |
+| Vision | 401M-parameter MoonViT-V2 | Absent | ⚪ out of scope |
+| Native quantization | MXFP4 expert weights / MXFP8 activations with QAT | Standard PyTorch precision | ⚪ out of scope |
 
-The delta-rule code is an educational recurrence, not numerical equivalence to the fused K3 kernel.
-The router implements bias-aware dispatch, but does not update biases with report-scale histogram
-Quantile Balancing. These boundaries are intentional and tested—not hidden in marketing language.
+The KDA path deliberately omits ShortConv, Swish projections, low-rank decay projection, and the
+chunkwise fused algorithm. The global layer is not MLA. Quantile Balancing is exact only over the
+local teaching batch, not a distributed global histogram. These boundaries are explicit; tests
+cover the recurrence’s numerical behavior, causality, routing counts, next-step bias update,
+initialization scale, valid configuration, generation guardrails, and corpus-window boundaries.
+
+One subtle experiment: with `top_k=1`, the normalized selected router weight is exactly one, so the
+router receives essentially no gradient through mixture weights. K3 uses top-16. Treat top-1 here
+as a demonstration of that failure mode, not as a recommended setting.
+
+## Report-to-code map
+
+| Report section | Read this code | Preserved | Deliberately omitted or reduced |
+|---|---|---|---|
+| §2.1.1, Eqs. 1 & 5 | `KimiDeltaAttention` | Decay-before-correction recurrence, channel-wise retention, learned per-head scale | ShortConv, Swish, low-rank decay projection, chunkwise kernel |
+| §2.1.1, Eq. 6 | `KimiDeltaAttention.forward` | Head RMSNorm and full-rank sigmoid output gate | Fused training kernel |
+| §2.2, Eqs. 8–10 | `MicroK3._mix_depth` and `Block.forward` | Learned pseudo-query, normalized keys, softmax over prior contributions | Block grouping and intra-block partial sums |
+| §2.3, Eqs. 11–12 | `StableLatentMoE` and `SiTUGLU` | Latent routed path, pre-up RMSNorm, bounded GLU, shared path | Report-scale widths and second shared expert |
+| §2.3.3, Eqs. 13–14 | `StableLatentMoE._update_router_bias` | Bias only affects dispatch; quantile bias is used on the next pass | Distributed histogram approximation |
+
+Default tensor shapes make the scale reduction concrete:
+
+```text
+tokens                         [batch, time]
+hidden                         [batch, time, 128]
+one KDA recurrent state        [batch, 4 heads, 32 key channels, 32 value channels]
+MoE router scores              [batch, time, 8 experts]
+selected experts               [batch, time, 2]
+depth sources                  embedding + one contribution per completed layer
+```
 
 ## Model archaeology without a 1.5 TB accident
 
-The report and repository appeared on **July 27, 2026**. We inspected the official 2.5 MB report and
-repository metadata. Hugging Face was inaccessible from the build environment, so we make **no
-weight-tensor-derived claims**. [`scripts/inspect_k3_metadata.py`](scripts/inspect_k3_metadata.py)
-lists remote filenames and HEAD metadata, refuses large downloads, and writes nothing by default:
+The report and repository appeared on July 27, 2026. The metadata helper lists remote filenames
+and performs HEAD requests for weight sizes; it has no file-download call and writes nothing:
 
 ```bash
-pip install huggingface_hub
+pip install -e '.[inspect]'
 python scripts/inspect_k3_metadata.py
 ```
 
-Do not use `snapshot_download` for this model on a laptop. See the exact observations and primary
-links in [`docs/report-notes.md`](docs/report-notes.md).
+On the 2026-07-28 UTC snapshot, it observed 118 files, including 96 weight shards totaling 1.420
+TiB. Remote repositories can change, so the script prints the current values rather than treating
+that snapshot as permanent. See [`docs/report-notes.md`](docs/report-notes.md) for primary links,
+equation-level notes, and the exact simplifications.
 
 ## Modal
 
@@ -87,7 +138,7 @@ Use credits deliberately. The cloud entrypoint has a 30-minute hard timeout, cap
 uses one GPU, and creates no persistent model-weight volume.
 
 ```bash
-pip install modal
+pip install -e '.[modal]'
 modal setup
 modal run modal_train.py --steps 500
 ```
@@ -98,15 +149,29 @@ and availability change, so check Modal before launching. The K3 weights are nev
 
 ## Experiments worth trying
 
-- Plot `block.moe.last_load`; which experts specialize on punctuation or code?
-- Change `top_k` from 2 → 1. Does training destabilize?
-- Replace the bounded decay with a softplus decay and inspect long-prefix retention.
-- Implement the report's next-batch Quantile Balancing update.
+- Plot `block.moe.last_load` and `block.moe.router_bias`; which experts specialize, and how quickly
+  does the local Quantile Balancing update respond?
+- Disable `_update_router_bias` for one run and compare expert loads.
+- Change `top_k` from 2 → 1 and confirm why the normalized router-weight gradient disappears.
+- Replace the bounded decay with an unbounded softplus decay and inspect long-prefix retention.
+- Add the omitted ShortConv + Swish projections, then compare the tensor trace.
 - Replace `GatedAttention` with a true latent KV cache and measure memory.
+
+## Development
+
+```bash
+ruff check .
+ruff format --check .
+pytest
+python -m build
+```
+
+CI runs those checks on Python 3.10 and 3.13, builds the wheel and source distribution, installs
+the wheel outside the checkout, imports `microk3`, and exercises the installed CLI.
 
 ## Scope, sources, and license
 
-The architecture facts are drawn from Moonshot AI's [official repository](https://github.com/MoonshotAI/Kimi-K3)
+Architecture facts come from Moonshot AI's [official repository](https://github.com/MoonshotAI/Kimi-K3)
 and [technical report](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf).
 This repository contains original educational code under MIT. Kimi K3 weights have their own
 [model license](https://huggingface.co/moonshotai/Kimi-K3/blob/main/LICENSE); this project neither

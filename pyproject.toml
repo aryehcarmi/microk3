@@ -1,15 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "microk3"
 version = "0.1.0"
 description = "A tiny, readable Kimi K3-inspired learning model"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Aryeh Carmi" }]
 requires-python = ">=3.10"
-dependencies = ["torch>=2.2"]
+dependencies = ["torch>=2.2,<3"]
+
+[project.scripts]
+microk3 = "microk3:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["build>=1.2", "numpy>=1.26", "pytest>=8", "ruff>=0.6"]
+inspect = ["huggingface-hub>=0.24"]
+modal = ["modal>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/aryehcarmi/microk3"
+Repository = "https://github.com/aryehcarmi/microk3"
+
+[tool.setuptools]
+py-modules = ["microk3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra"
 
 [tool.ruff]
 line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]

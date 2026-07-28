@@ -3,8 +3,10 @@
 import modal
 
 app = modal.App("microk3-teaching-run")
-image = modal.Image.debian_slim(python_version="3.12").pip_install("torch>=2.2").add_local_file(
-    "microk3.py", "/root/microk3.py"
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("torch>=2.2,<3")
+    .add_local_file("microk3.py", "/root/microk3.py")
 )
 
 

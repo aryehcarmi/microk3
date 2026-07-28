@@ -4,6 +4,9 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 *.pyc
+build/
+dist/
+*.whl
 *.pt
 *.pth
 checkpoints/

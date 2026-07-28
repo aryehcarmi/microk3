@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import math
-import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +30,29 @@ class Config:
     block_size: int = 128
     dropout: float = 0.0
 
+    def __post_init__(self) -> None:
+        positive = {
+            "vocab_size": self.vocab_size,
+            "dim": self.dim,
+            "latent_dim": self.latent_dim,
+            "expert_hidden": self.expert_hidden,
+            "layers": self.layers,
+            "heads": self.heads,
+            "experts": self.experts,
+            "block_size": self.block_size,
+        }
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if self.vocab_size < 2:
+            raise ValueError("vocab_size must be at least 2")
+        if self.dim % self.heads != 0:
+            raise ValueError(f"dim ({self.dim}) must be divisible by heads ({self.heads})")
+        if not 1 <= self.top_k <= self.experts:
+            raise ValueError(f"top_k must be between 1 and experts ({self.experts}), got {self.top_k}")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int):
@@ -40,19 +63,37 @@ class RMSNorm(nn.Module):
         return self.weight * F.rms_norm(x, (x.size(-1),))
 
 
-class KimiDeltaAttention(nn.Module):
-    """Transparent recurrent delta rule with K3's lower-bounded decay.
+def delta_rule_step(
+    state: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply one readable KDA recurrence step from report Eq. 1."""
+    decayed = alpha * state
+    prediction = torch.einsum("bhij,bhi->bhj", decayed, key)
+    error = value - prediction
+    update = torch.einsum("bhi,bhj->bhij", key, beta * error)
+    state = decayed + update
+    output = torch.einsum("bhij,bhi->bhj", state, query)
+    return state, output
 
-    The report uses a fused chunkwise algorithm. This equivalent token loop is
-    intentionally slow and legible: S <- decay*S + beta*(v - S^T k)*k.
+
+class KimiDeltaAttention(nn.Module):
+    """Transparent recurrent form of K3's channel-wise delta rule.
+
+    The report uses ShortConv + Swish projections and a fused chunkwise kernel.
+    We keep plain projections and an intentionally slow, legible token loop.
     """
 
     def __init__(self, cfg: Config):
         super().__init__()
-        assert cfg.dim % cfg.heads == 0
         self.heads, self.head_dim = cfg.heads, cfg.dim // cfg.heads
         self.qkv = nn.Linear(cfg.dim, 3 * cfg.dim, bias=False)
-        self.decay = nn.Linear(cfg.dim, cfg.heads, bias=True)
+        self.decay = nn.Linear(cfg.dim, cfg.dim, bias=True)
+        self.log_decay_scale = nn.Parameter(torch.zeros(cfg.heads))
         self.beta = nn.Linear(cfg.dim, cfg.heads, bias=True)
         self.gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
         self.out = nn.Linear(cfg.dim, cfg.dim, bias=False)
@@ -61,20 +102,22 @@ class KimiDeltaAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, _ = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q = F.normalize(q.view(b, t, self.heads, self.head_dim), dim=-1)
-        k = F.normalize(k.view(b, t, self.heads, self.head_dim), dim=-1)
+        q = q.view(b, t, self.heads, self.head_dim)
+        k = k.view(b, t, self.heads, self.head_dim)
+        # Normalize in FP32 so a zero vector stays finite in FP16/BF16.
+        q = F.normalize(q.float(), dim=-1, eps=1e-6).to(q.dtype)
+        k = F.normalize(k.float(), dim=-1, eps=1e-6).to(k.dtype)
         v = v.view(b, t, self.heads, self.head_dim)
-        # Eq. 5 of the report: log decay is bounded in (-5, 0).
-        alpha = torch.exp(-5.0 * torch.sigmoid(self.decay(x))).unsqueeze(-1).unsqueeze(-1)
+        # Eq. 5: per-key-channel log decay is bounded in (-5, 0).
+        decay_logits = self.decay(x).view(b, t, self.heads, self.head_dim)
+        decay_scale = self.log_decay_scale.exp().view(1, 1, self.heads, 1)
+        alpha = torch.exp(-5.0 * torch.sigmoid(decay_scale * decay_logits)).unsqueeze(-1)
         beta = torch.sigmoid(self.beta(x)).unsqueeze(-1)
         state = x.new_zeros(b, self.heads, self.head_dim, self.head_dim)
         outputs = []
         for i in range(t):
-            prediction = torch.einsum("bhij,bhi->bhj", state, k[:, i])
-            error = v[:, i] - prediction
-            update = torch.einsum("bhi,bhj->bhij", k[:, i], beta[:, i] * error)
-            state = alpha[:, i] * state + update
-            outputs.append(torch.einsum("bhij,bhi->bhj", state, q[:, i]))
+            state, output = delta_rule_step(state, k[:, i], v[:, i], q[:, i], alpha[:, i], beta[:, i])
+            outputs.append(output)
         y = torch.stack(outputs, dim=1)
         y = self.norm(y).reshape(b, t, -1)
         return self.out(torch.sigmoid(self.gate(x)) * y)
@@ -126,15 +169,33 @@ class StableLatentMoE(nn.Module):
         self.shared = SiTUGLU(cfg.dim, cfg.expert_hidden)
         self.last_load: torch.Tensor | None = None
 
+    @torch.no_grad()
+    def _update_router_bias(self, scores: torch.Tensor, cutoff: torch.Tensor) -> None:
+        """Apply exact, batch-local Quantile Balancing for the next forward pass."""
+        margins = scores.reshape(-1, len(self.experts)).float() - cutoff.reshape(-1, 1).float()
+        quantile = torch.quantile(margins, 1.0 - self.top_k / len(self.experts), dim=0)
+        next_bias = -quantile
+        next_bias -= next_bias.mean()
+        self.router_bias.copy_(next_bias.to(self.router_bias))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         scores = torch.sigmoid(self.router(x))
-        _, chosen = torch.topk(scores + self.router_bias, self.top_k, dim=-1)
+        biased_scores = scores + self.router_bias
+        if self.top_k < len(self.experts):
+            ranked_scores, ranked = torch.topk(biased_scores, self.top_k + 1, dim=-1)
+            chosen = ranked[..., : self.top_k]
+            cutoff = ranked_scores[..., self.top_k]
+        else:
+            _, chosen = torch.topk(biased_scores, self.top_k, dim=-1)
+            cutoff = None
         mask = F.one_hot(chosen, len(self.experts)).sum(-2).to(scores.dtype)
         weights = scores * mask
         weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-9)
         z = self.down(x)
         routed = sum(weights[..., i, None] * expert(z) for i, expert in enumerate(self.experts))
         self.last_load = mask.detach().sum((0, 1))
+        if self.training and cutoff is not None:
+            self._update_router_bias(scores.detach(), cutoff.detach())
         return self.shared(x) + self.up(self.latent_norm(routed))
 
 
@@ -144,10 +205,13 @@ class Block(nn.Module):
         self.norm1, self.norm2 = RMSNorm(cfg.dim), RMSNorm(cfg.dim)
         self.mix = GatedAttention(cfg) if global_attention else KimiDeltaAttention(cfg)
         self.moe = StableLatentMoE(cfg)
+        self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.mix(self.norm1(x))
-        return x + self.moe(self.norm2(x))
+        """Return this layer's contribution, not a cumulative residual state."""
+        mixed = self.dropout(self.mix(self.norm1(x)))
+        routed = self.dropout(self.moe(self.norm2(x + mixed)))
+        return mixed + routed
 
 
 class MicroK3(nn.Module):
@@ -155,27 +219,69 @@ class MicroK3(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.token = nn.Embedding(cfg.vocab_size, cfg.dim)
-        # K3 uses 3 KDA : 1 global-attention layers. No positional embeddings.
-        self.blocks = nn.ModuleList(Block(cfg, (i + 1) % 4 == 0) for i in range(cfg.layers))
-        self.depth_queries = nn.Parameter(torch.zeros(cfg.layers, cfg.dim))
+        # K3 repeats 3 KDA : 1 global attention and always ends globally.
+        self.blocks = nn.ModuleList(
+            Block(cfg, (i + 1) % 4 == 0 or i == cfg.layers - 1) for i in range(cfg.layers)
+        )
+        self.depth_queries = nn.Parameter(torch.zeros(cfg.layers + 1, cfg.dim))
         self.norm = RMSNorm(cfg.dim)
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+        self.apply(self._init_weights)
         self.lm_head.weight = self.token.weight
 
-    def forward(self, tokens: torch.Tensor, targets: torch.Tensor | None = None):
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        """Keep tied byte-token logits near the uniform-loss baseline at startup."""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if getattr(module, "bias", None) is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(
+        self, tokens: torch.Tensor, targets: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] == 0:
+            raise ValueError(f"tokens must have non-empty [batch, time] shape, got {tuple(tokens.shape)}")
+        if tokens.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"tokens must use an integer dtype, got {tokens.dtype}")
+        if targets is not None and targets.shape != tokens.shape:
+            raise ValueError(
+                f"targets shape {tuple(targets.shape)} must match tokens shape {tuple(tokens.shape)}"
+            )
+        if targets is not None and targets.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"targets must use an integer dtype, got {targets.dtype}")
         sources = [self.token(tokens)]
         for i, block in enumerate(self.blocks):
-            keys = torch.stack([F.rms_norm(s, (s.size(-1),)) for s in sources], dim=0)
-            logits = torch.einsum("d,nbtd->nbt", self.depth_queries[i], keys) / math.sqrt(self.cfg.dim)
-            weights = logits.softmax(0)
-            x = sum(weights[j, ..., None] * s for j, s in enumerate(sources))
+            x = self._mix_depth(self.depth_queries[i], sources)
             sources.append(block(x))
-        logits = self.lm_head(self.norm(sources[-1]))
+        final = self._mix_depth(self.depth_queries[-1], sources)
+        logits = self.lm_head(self.norm(final))
         loss = None if targets is None else F.cross_entropy(logits.flatten(0, 1), targets.flatten())
         return logits, loss
 
+    @staticmethod
+    def _mix_depth(query: torch.Tensor, sources: list[torch.Tensor]) -> torch.Tensor:
+        """Full AttnRes-style retrieval over the embedding and layer contributions."""
+        keys = torch.stack([F.rms_norm(source, (source.size(-1),)) for source in sources], dim=0)
+        weights = torch.einsum("d,nbtd->nbt", query, keys).softmax(0)
+        return sum(weights[j, ..., None] * source for j, source in enumerate(sources))
+
     @torch.no_grad()
-    def generate(self, tokens: torch.Tensor, count: int, temperature: float = 0.8):
+    def generate(self, tokens: torch.Tensor, count: int, temperature: float = 0.8) -> torch.Tensor:
+        if count < 0:
+            raise ValueError(f"count must be non-negative, got {count}")
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError(f"temperature must be finite and positive, got {temperature}")
+        if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] == 0:
+            raise ValueError(f"tokens must have non-empty [batch, time] shape, got {tuple(tokens.shape)}")
+        if tokens.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"tokens must use an integer dtype, got {tokens.dtype}")
+        low, high = torch.aminmax(tokens)
+        minimum, maximum = low.item(), high.item()
+        if minimum < 0 or maximum >= self.cfg.vocab_size:
+            raise ValueError(
+                f"tokens must be in [0, {self.cfg.vocab_size}), got range [{minimum}, {maximum}]"
+            )
         for _ in range(count):
             logits, _ = self(tokens[:, -self.cfg.block_size :])
             probs = (logits[:, -1] / temperature).softmax(-1)
@@ -186,39 +292,130 @@ class MicroK3(nn.Module):
 def corpus(path: str | None) -> bytes:
     if path:
         return Path(path).read_bytes()
-    return ("microK3 learns by predicting the next byte.\n"
-            "delta attention remembers; experts specialize; depth can attend.\n" * 80).encode()
+    return (
+        "microK3 learns by predicting the next byte.\n"
+        "delta attention remembers; experts specialize; depth can attend.\n" * 80
+    ).encode()
+
+
+def sample_batch(data: torch.Tensor, block_size: int, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample next-byte windows, including the final valid window."""
+    if data.ndim != 1:
+        raise ValueError(f"data must be a one-dimensional token stream, got shape {tuple(data.shape)}")
+    if block_size <= 0 or batch_size <= 0:
+        raise ValueError("block_size and batch_size must be positive")
+    if data.numel() <= block_size:
+        raise ValueError(
+            f"corpus has {data.numel()} bytes; it needs at least {block_size + 1} for block_size={block_size}"
+        )
+    starts = torch.randint(0, data.numel() - block_size, (batch_size,), device=data.device)
+    offsets = starts[:, None] + torch.arange(block_size, device=data.device)
+    return data[offsets], data[offsets + 1]
+
+
+def default_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def available_device(value: str) -> str:
+    device = torch.device(value)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise argparse.ArgumentTypeError("CUDA was requested, but no CUDA device is available")
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        raise argparse.ArgumentTypeError("MPS was requested, but no MPS device is available")
+    return value
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
+    return parsed
+
+
+def styled(text: str, color: int) -> str:
+    return f"\033[38;5;{color}m{text}\033[0m" if sys.stdout.isatty() else text
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     p.add_argument("--data", help="UTF-8 or arbitrary byte corpus")
-    p.add_argument("--steps", type=int, default=100)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--steps", type=positive_int, default=100)
+    p.add_argument("--batch-size", type=positive_int, default=8)
+    p.add_argument("--block-size", type=positive_int, default=128)
+    p.add_argument("--learning-rate", type=positive_float, default=3e-4)
+    p.add_argument(
+        "--generate",
+        type=non_negative_int,
+        default=120,
+        help="bytes to sample after training; use 0 to skip",
+    )
+    p.add_argument("--temperature", type=positive_float, default=0.8)
+    p.add_argument("--prompt", default="m", help="UTF-8 generation prompt")
+    p.add_argument("--device", type=available_device, default=default_device())
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
-    random.seed(args.seed)
+
+    prompt = args.prompt.encode()
+    if args.generate and not prompt:
+        p.error("--prompt must encode to at least one byte")
+
     torch.manual_seed(args.seed)
-    cfg = Config()
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    cfg = Config(block_size=args.block_size)
     model = MicroK3(cfg).to(args.device)
     data = torch.tensor(list(corpus(args.data)), dtype=torch.long, device=args.device)
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    print(f"\033[38;5;81m◆ microK3\033[0m  {sum(p.numel() for p in model.parameters()):,} parameters  {args.device}")
+    if data.numel() <= cfg.block_size:
+        p.error(
+            f"corpus has {data.numel()} bytes; use at least {cfg.block_size + 1} bytes "
+            "or choose a smaller --block-size"
+        )
+    opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    count = sum(parameter.numel() for parameter in model.parameters())
+    python_version = ".".join(map(str, sys.version_info[:3]))
+    print(
+        f"{styled('◆ microK3', 81)}  {count:,} parameters  {args.device}  "
+        f"python {python_version}  torch {torch.__version__}  seed {args.seed}  "
+        f"block {cfg.block_size}  batch {args.batch_size}"
+    )
     model.train()
     for step in range(args.steps):
-        starts = torch.randint(0, len(data) - cfg.block_size - 1, (8,), device=args.device)
-        x = torch.stack([data[s:s + cfg.block_size] for s in starts])
-        y = torch.stack([data[s + 1:s + cfg.block_size + 1] for s in starts])
+        x, y = sample_batch(data, cfg.block_size, args.batch_size)
         _, loss = model(x, y)
         opt.zero_grad(set_to_none=True)
+        assert loss is not None
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step % 10 == 0 or step == args.steps - 1:
-            print(f"\033[38;5;213mstep {step:04d}\033[0m  loss {loss.item():.4f}")
+            print(f"{styled(f'step {step:04d}', 213)}  loss {loss.item():.4f}")
     model.eval()
-    sample = model.generate(torch.tensor([[ord('m')]], device=args.device), 120)[0].cpu().tolist()
-    print("\n" + bytes(sample).decode("utf-8", errors="replace"))
+    if args.generate:
+        seed = torch.tensor([list(prompt)], dtype=torch.long, device=args.device)
+        sample = model.generate(seed, args.generate, args.temperature)[0].cpu().tolist()
+        print("\n" + bytes(sample).decode("utf-8", errors="replace"))
 
 
 if __name__ == "__main__":
