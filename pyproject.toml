@@ -1,0 +1,15 @@
+[project]
+name = "microk3"
+version = "0.1.0"
+description = "A tiny, readable Kimi K3-inspired learning model"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
