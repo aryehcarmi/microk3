@@ -22,7 +22,7 @@
 
 ## Why this exists
 
-Kimi K3 combines several beautiful ideas: recurrent **Kimi Delta Attention**, periodic global
+Kimi K3 combines four ideas: recurrent **Kimi Delta Attention**, periodic global
 attention, **Attention Residuals** across depth, and a **Stable LatentMoE** across width. The
 official implementation needs industrial infrastructure. This repository turns the conceptual
 spine into one hackable file, one diagram, and a small regression suite.
