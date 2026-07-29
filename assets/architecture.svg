@@ -1,10 +1,343 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 500" role="img" aria-labelledby="title desc">
-<title id="title">microK3 teaching architecture</title>
-<desc id="desc">Three cards show information flow across sequence with delta and global attention, depth with Attention Residuals, and width with Stable LatentMoE. microK3 routes to two of eight experts while Kimi K3 routes to sixteen of 896.</desc>
-<defs><linearGradient id="a"><stop stop-color="#38bdf8"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient><filter id="s"><feDropShadow dx="0" dy="8" stdDeviation="8" flood-opacity=".18"/></filter><marker id="m" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0l8 4-8 4z" fill="#64748b"/></marker></defs>
-<rect width="1100" height="500" rx="24" fill="#f8fafc"/><text x="55" y="62" font-family="sans-serif" font-size="27" font-weight="700" fill="#172554">Three axes of information flow</text>
-<g font-family="sans-serif" text-anchor="middle" filter="url(#s)"><g transform="translate(55 110)"><rect width="290" height="275" rx="22" fill="#e0f2fe"/><text x="145" y="42" font-size="21" font-weight="700" fill="#075985">SEQUENCE</text><path d="M55 105h175M55 155h175M55 205h175" stroke="#0284c7" stroke-width="5" marker-end="url(#m)"/><circle cx="55" cy="105" r="12" fill="#38bdf8"/><circle cx="55" cy="155" r="12" fill="#38bdf8"/><circle cx="55" cy="205" r="12" fill="#38bdf8"/><text x="145" y="250" fill="#075985">KDA + global attention</text></g>
-<g transform="translate(405 110)"><rect width="290" height="275" rx="22" fill="#ede9fe"/><text x="145" y="42" font-size="21" font-weight="700" fill="#5b21b6">DEPTH</text><rect x="55" y="80" width="180" height="30" rx="8" fill="#c4b5fd"/><rect x="55" y="130" width="180" height="30" rx="8" fill="#a78bfa"/><rect x="55" y="180" width="180" height="30" rx="8" fill="#8b5cf6"/><path d="M40 95C5 150 5 195 45 195" fill="none" stroke="#6d28d9" stroke-width="4" marker-end="url(#m)"/><text x="145" y="250" fill="#5b21b6">Attention Residuals</text></g>
-<g transform="translate(755 110)"><rect width="290" height="275" rx="22" fill="#fce7f3"/><text x="145" y="42" font-size="21" font-weight="700" fill="#9d174d">WIDTH</text><path d="M35 115h55M200 115h55" stroke="#db2777" stroke-width="4" marker-end="url(#m)"/><circle cx="118" cy="85" r="24" fill="#f9a8d4"/><circle cx="170" cy="85" r="24" fill="#f472b6"/><circle cx="118" cy="145" r="24" fill="#f472b6"/><circle cx="170" cy="145" r="24" fill="#f9a8d4"/><text x="145" y="193" fill="#be185d">microK3: top-2 of 8</text><text x="145" y="222" fill="#be185d">K3: top-16 of 896</text><text x="145" y="253" fill="#9d174d">Stable LatentMoE</text></g></g>
-<rect x="185" y="430" width="730" height="42" rx="21" fill="url(#a)"/><text x="550" y="458" text-anchor="middle" font-family="ui-monospace,monospace" font-size="18" fill="white">readable PyTorch · byte tokens · no giant downloads</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 904" role="img" aria-labelledby="title desc"
+     font-family="ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
+<title id="title">One forward pass through microK3</title>
+<desc id="desc">A four-band architecture diagram. Band one traces the forward pass: bytes, token embedding,
+four layers (three Kimi Delta Attention layers then one gated global-attention layer, the first with a dense
+feed-forward and the rest with a Stable LatentMoE), a final depth mix, RMSNorm, and a tied language-model head.
+Layers never feed each other directly; each writes its contribution onto a growing depth bus and reads a learned
+softmax mix of the embedding and all earlier contributions. Band two details one block's internals, the KDA
+recurrent step with its constant-size state, the lower-triangular depth-attention pattern over five learned
+queries, and the Stable LatentMoE routing path with a shared full-width expert. Band three compares decoding
+memory (constant KDA state versus growing global key/value cache), the per-head Muon and AdamW optimizer split,
+and microK3's teaching scale against Kimi K3.</desc>
+
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#070a1e"/><stop offset=".5" stop-color="#221046"/><stop offset="1" stop-color="#04222f"/>
+  </linearGradient>
+  <radialGradient id="orb"><stop stop-color="#5ee7ff" stop-opacity=".55"/><stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/></radialGradient>
+  <filter id="gl" x="-90%" y="-90%" width="280%" height="280%">
+    <feGaussianBlur stdDeviation="4" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <marker id="aA" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M.5.7 8.5 4.5.5 8.3Z" fill="#fbbf24"/></marker>
+  <marker id="aC" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M.5.7 8.5 4.5.5 8.3Z" fill="#22d3ee"/></marker>
+  <marker id="aB" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M.5.7 8.5 4.5.5 8.3Z" fill="#60a5fa"/></marker>
+  <marker id="aP" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M.5.7 8.5 4.5.5 8.3Z" fill="#f472b6"/></marker>
+  <marker id="aE" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M.5.7 8.5 4.5.5 8.3Z" fill="#34d399"/></marker>
+  <marker id="aS" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M.5.7 8.5 4.5.5 8.3Z" fill="#94a3b8"/></marker>
+</defs>
+
+<!-- ══ canvas ══ -->
+<rect width="1180" height="904" rx="26" fill="url(#bg)"/>
+<circle cx="1060" cy="40" r="260" fill="url(#orb)" opacity=".5"/>
+<circle cx="90" cy="880" r="220" fill="url(#orb)" opacity=".35"/>
+<g stroke="#7dd3fc" opacity=".05">
+  <path d="M0 120h1180M0 240h1180M0 360h1180M0 480h1180M0 600h1180M0 720h1180M0 840h1180"/>
+  <path d="M170 0v904M350 0v904M530 0v904M710 0v904M890 0v904M1070 0v904"/>
+</g>
+
+<!-- ══ header ══ -->
+<text x="44" y="49" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="30" font-weight="700" fill="#ffffff">micro<tspan fill="#67e8f9">K3</tspan></text>
+<text x="184" y="49" font-size="17" fill="#cbd5e1">the whole model on one page</text>
+<text x="45" y="76" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="12" fill="#94a3b8">Config(layers=4, dim=128, heads=4, experts=8, top_k=2, latent_dim=64, expert_hidden=192, dense_layers=1, vocab_size=256) · 1,645,496 params</text>
+<g font-size="12.5" fill="#cbd5e1">
+  <circle cx="650" cy="48" r="5" fill="#22d3ee"/><text x="661" y="52">KDA layer</text>
+  <circle cx="740" cy="48" r="5" fill="#60a5fa"/><text x="751" y="52">global attention</text>
+  <circle cx="877" cy="48" r="5" fill="#f472b6"/><text x="888" y="52">Stable LatentMoE</text>
+  <circle cx="1014" cy="48" r="5" fill="#fbbf24"/><text x="1025" y="52">depth attention</text>
+</g>
+
+<!-- ══════════ BAND 1 · the spine ══════════ -->
+<rect x="32" y="94" width="1116" height="300" rx="18" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".11"/>
+<text x="52" y="120" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="11" letter-spacing="1.6" fill="#fbbf24">THE SPINE</text>
+<text x="134" y="120" font-size="12.5" fill="#cbd5e1">every layer reads a learned mix of the embedding and all earlier contributions, then appends its own</text>
+
+<!-- schedule brackets -->
+<g fill="none" stroke-width="1.2">
+  <path d="M262 152v-6h382v6" stroke="#22d3ee" stroke-opacity=".45"/>
+  <path d="M661 152v-6h116v6" stroke="#60a5fa" stroke-opacity=".45"/>
+</g>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" text-anchor="middle">
+  <text x="453" y="140" fill="#a5f3fc">3 × KDA · constant-size state</text>
+  <text x="719" y="140" fill="#bfdbfe">gated global · no positions</text>
+</g>
+
+<!-- terminals and the head -->
+<g text-anchor="middle">
+  <rect x="52" y="172" width="80" height="48" rx="24" fill="#ffffff" fill-opacity=".06" stroke="#ffffff" stroke-opacity=".16"/>
+  <text x="92" y="194" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#e2e8f0">bytes</text>
+  <text x="92" y="210" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">[B, T]</text>
+
+  <rect x="149" y="160" width="96" height="76" rx="12" fill="#fbbf24" fill-opacity=".10" stroke="#fbbf24" stroke-opacity=".45"/>
+  <text x="197" y="184" font-size="12" font-weight="700" fill="#fde68a">token embed</text>
+  <text x="197" y="201" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#cbd5e1">256 × 128</text>
+  <text x="197" y="218" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">tied to head</text>
+
+  <rect x="794" y="160" width="100" height="76" rx="12" fill="#fbbf24" fill-opacity=".12" stroke="#fbbf24" stroke-opacity=".5"/>
+  <text x="844" y="184" font-size="12" font-weight="700" fill="#fde68a">depth mix</text>
+  <text x="844" y="202" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#cbd5e1">q4 · 5 srcs</text>
+  <text x="844" y="220" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">softmax</text>
+
+  <rect x="911" y="160" width="112" height="76" rx="12" fill="#ffffff" fill-opacity=".05" stroke="#ffffff" stroke-opacity=".16"/>
+  <text x="967" y="182" font-size="11" fill="#e2e8f0">RMSNorm</text>
+  <text x="967" y="200" font-size="11" fill="#e2e8f0">lm_head (tied)</text>
+  <text x="967" y="220" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">128 → 256</text>
+
+  <rect x="1040" y="172" width="88" height="48" rx="24" fill="#ffffff" fill-opacity=".06" stroke="#ffffff" stroke-opacity=".16"/>
+  <text x="1084" y="194" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#e2e8f0">logits</text>
+  <text x="1084" y="210" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">[B, T, 256]</text>
+</g>
+<g stroke="#94a3b8" stroke-width="1.6" marker-end="url(#aS)">
+  <path d="M134 196h12"/><path d="M896 196h12"/><path d="M1025 196h12"/>
+</g>
+
+<!-- the four layers -->
+<g text-anchor="middle">
+  <!-- L0 · KDA + dense FFN -->
+  <rect x="262" y="160" width="116" height="76" rx="12" fill="#22d3ee" fill-opacity=".09" stroke="#22d3ee" stroke-opacity=".45"/>
+  <text x="272" y="178" text-anchor="start" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">L0</text>
+  <rect x="271" y="184" width="98" height="20" rx="10" fill="#22d3ee" fill-opacity=".22" stroke="#22d3ee" stroke-opacity=".5"/>
+  <text x="320" y="198" font-size="11" font-weight="700" fill="#a5f3fc">KDA</text>
+  <rect x="271" y="208" width="98" height="20" rx="10" fill="#34d399" fill-opacity=".18" stroke="#34d399" stroke-opacity=".42"/>
+  <text x="320" y="222" font-size="10" fill="#a7f3d0">dense SiTU-GLU</text>
+  <!-- L1 · KDA + MoE -->
+  <rect x="395" y="160" width="116" height="76" rx="12" fill="#22d3ee" fill-opacity=".09" stroke="#22d3ee" stroke-opacity=".45"/>
+  <text x="405" y="178" text-anchor="start" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">L1</text>
+  <rect x="404" y="184" width="98" height="20" rx="10" fill="#22d3ee" fill-opacity=".22" stroke="#22d3ee" stroke-opacity=".5"/>
+  <text x="453" y="198" font-size="11" font-weight="700" fill="#a5f3fc">KDA</text>
+  <rect x="404" y="208" width="98" height="20" rx="10" fill="#f472b6" fill-opacity=".20" stroke="#f472b6" stroke-opacity=".42"/>
+  <text x="453" y="222" font-size="10" fill="#fbcfe8">LatentMoE 2/8</text>
+  <!-- L2 · KDA + MoE -->
+  <rect x="528" y="160" width="116" height="76" rx="12" fill="#22d3ee" fill-opacity=".09" stroke="#22d3ee" stroke-opacity=".45"/>
+  <text x="538" y="178" text-anchor="start" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">L2</text>
+  <rect x="537" y="184" width="98" height="20" rx="10" fill="#22d3ee" fill-opacity=".22" stroke="#22d3ee" stroke-opacity=".5"/>
+  <text x="586" y="198" font-size="11" font-weight="700" fill="#a5f3fc">KDA</text>
+  <rect x="537" y="208" width="98" height="20" rx="10" fill="#f472b6" fill-opacity=".20" stroke="#f472b6" stroke-opacity=".42"/>
+  <text x="586" y="222" font-size="10" fill="#fbcfe8">LatentMoE 2/8</text>
+  <!-- L3 · gated global + MoE -->
+  <rect x="661" y="160" width="116" height="76" rx="12" fill="#60a5fa" fill-opacity=".09" stroke="#60a5fa" stroke-opacity=".45"/>
+  <text x="671" y="178" text-anchor="start" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">L3</text>
+  <rect x="670" y="184" width="98" height="20" rx="10" fill="#60a5fa" fill-opacity=".22" stroke="#60a5fa" stroke-opacity=".5"/>
+  <text x="719" y="198" font-size="11" font-weight="700" fill="#bfdbfe">gated attn</text>
+  <rect x="670" y="208" width="98" height="20" rx="10" fill="#f472b6" fill-opacity=".20" stroke="#f472b6" stroke-opacity=".42"/>
+  <text x="719" y="222" font-size="10" fill="#fbcfe8">LatentMoE 2/8</text>
+</g>
+
+<!-- the depth bus: sources accumulate left to right -->
+<path d="M180 300 800 296 800 306 180 302Z" fill="#fbbf24" fill-opacity=".30"/>
+<g stroke-width="1.6" fill="none">
+  <path d="M197 238v53" stroke="#fbbf24" stroke-opacity=".8" marker-end="url(#aA)"/>
+  <path d="M354 238v53" stroke="#22d3ee" stroke-opacity=".8" marker-end="url(#aC)"/>
+  <path d="M487 238v53" stroke="#22d3ee" stroke-opacity=".8" marker-end="url(#aC)"/>
+  <path d="M620 238v53" stroke="#22d3ee" stroke-opacity=".8" marker-end="url(#aC)"/>
+  <path d="M753 238v53" stroke="#60a5fa" stroke-opacity=".8" marker-end="url(#aB)"/>
+</g>
+<g stroke="#fbbf24" stroke-opacity=".75" stroke-width="1.5" fill="none" marker-end="url(#aA)" stroke-dasharray="4 3">
+  <path d="M286 298v-57"/><path d="M419 298v-57"/><path d="M552 298v-57"/><path d="M685 298v-57"/>
+  <path d="M792 297C792 268 844 266 844 243"/>
+</g>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#fcd34d" text-anchor="end">
+  <text x="280" y="272">q0</text><text x="413" y="272">q1</text><text x="546" y="272">q2</text><text x="679" y="272">q3</text>
+</g>
+<g filter="url(#gl)">
+  <circle cx="197" cy="301" r="6" fill="#fbbf24"/><circle cx="354" cy="301" r="6" fill="#22d3ee"/>
+  <circle cx="487" cy="301" r="6" fill="#22d3ee"/><circle cx="620" cy="301" r="6" fill="#22d3ee"/>
+  <circle cx="753" cy="301" r="6" fill="#60a5fa"/>
+</g>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" text-anchor="middle">
+  <text x="197" y="320" fill="#fcd34d">emb</text><text x="354" y="320" fill="#a5f3fc">C0</text>
+  <text x="487" y="320" fill="#a5f3fc">C1</text><text x="620" y="320" fill="#a5f3fc">C2</text><text x="753" y="320" fill="#bfdbfe">C3</text>
+</g>
+<text x="470" y="350" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#fcd34d">x_i = Σ_j softmax_j( q_i · rmsnorm(source_j) ) · source_j</text>
+<text x="470" y="370" text-anchor="middle" font-size="11" fill="#94a3b8">the bus grows left to right — layer i sees i + 1 sources, the output query sees all 5</text>
+
+<rect x="866" y="312" width="282" height="70" rx="12" fill="#fbbf24" fill-opacity=".07" stroke="#fbbf24" stroke-opacity=".28"/>
+<text x="880" y="334" font-size="11.5" font-weight="700" fill="#fde68a">no residual stream</text>
+<text x="880" y="352" font-size="10.5" fill="#cbd5e1">Block.forward returns mixed + routed —</text>
+<text x="880" y="368" font-size="10.5" fill="#cbd5e1">its own contribution, not x + mixed + routed.</text>
+
+<!-- ══════════ BAND 2 · P1 · inside one block ══════════ -->
+<rect x="32" y="410" width="230" height="300" rx="16" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".11"/>
+<text x="46" y="438" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5" letter-spacing="1.2" fill="#e2e8f0">INSIDE ONE BLOCK</text>
+<text x="46" y="454" font-size="10" fill="#94a3b8">Block.forward, one layer</text>
+
+<g fill="none" stroke-width="1.4">
+  <path d="M74 478H52v78h92" stroke="#94a3b8" stroke-opacity=".55" marker-end="url(#aS)"/>
+  <path d="M244 517h6v117h-86" stroke="#22d3ee" stroke-opacity=".55" marker-end="url(#aC)"/>
+</g>
+<g stroke="#94a3b8" stroke-width="1.6" fill="none" marker-end="url(#aS)">
+  <path d="M154 488v9"/><path d="M154 534v9"/><path d="M154 566v9"/><path d="M154 612v9"/><path d="M154 644v9"/>
+</g>
+<g text-anchor="middle">
+  <rect x="74" y="468" width="160" height="20" rx="10" fill="#ffffff" fill-opacity=".07" stroke="#ffffff" stroke-opacity=".16"/>
+  <text x="154" y="482" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#cbd5e1">x  ·  from depth mix</text>
+
+  <rect x="64" y="500" width="180" height="34" rx="9" fill="#22d3ee" fill-opacity=".10" stroke="#22d3ee" stroke-opacity=".38"/>
+  <text x="154" y="514" font-size="10" fill="#e2e8f0">RMSNorm</text>
+  <text x="154" y="528" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#a5f3fc">KDA | gated attn</text>
+
+  <circle cx="154" cy="556" r="10" fill="#0b1030" stroke="#94a3b8" stroke-opacity=".6"/>
+  <text x="154" y="560" font-size="12" fill="#e2e8f0">+</text>
+
+  <rect x="64" y="578" width="180" height="34" rx="9" fill="#f472b6" fill-opacity=".10" stroke="#f472b6" stroke-opacity=".38"/>
+  <text x="154" y="592" font-size="10" fill="#e2e8f0">RMSNorm</text>
+  <text x="154" y="606" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#fbcfe8">MoE | dense GLU</text>
+
+  <circle cx="154" cy="634" r="10" fill="#0b1030" stroke="#94a3b8" stroke-opacity=".6"/>
+  <text x="154" y="638" font-size="12" fill="#e2e8f0">+</text>
+
+  <rect x="64" y="656" width="180" height="38" rx="9" fill="#fbbf24" fill-opacity=".12" stroke="#fbbf24" stroke-opacity=".42"/>
+  <text x="154" y="672" font-size="10.5" font-weight="700" fill="#fde68a">contribution</text>
+  <text x="154" y="687" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#cbd5e1">mixed + routed</text>
+</g>
+<text transform="rotate(-90 256 576)" x="256" y="576" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#a5f3fc">mixed</text>
+
+<!-- ══════════ BAND 2 · P2 · KDA ══════════ -->
+<rect x="276" y="410" width="322" height="300" rx="16" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".11"/>
+<text x="292" y="438" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5" letter-spacing="1.2" fill="#a5f3fc">SEQUENCE · KIMI DELTA ATTENTION</text>
+<text x="292" y="454" font-size="10" fill="#94a3b8">layers 0–2 · Eq. 1 recurrence, Eq. 5 decay</text>
+
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5">
+  <text x="292" y="483" fill="#e2e8f0">d  = α ⊙ S</text>
+  <text x="292" y="503" fill="#e2e8f0">e  = v − (d^T k)</text>
+  <text x="292" y="523" fill="#e2e8f0">S  = d + k ⊗ (β · e)</text>
+  <text x="292" y="543" fill="#e2e8f0">o  = S^T q</text>
+</g>
+<g font-size="9.5" fill="#94a3b8">
+  <text x="452" y="483">decay first</text>
+  <text x="452" y="503">prediction error</text>
+  <text x="452" y="523">delta correction</text>
+  <text x="452" y="543">read out</text>
+</g>
+
+<text x="292" y="562" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#a5f3fc">S = [B, 4, 32, 32]</text>
+<g fill="#22d3ee" fill-opacity=".13" stroke="#22d3ee" stroke-opacity=".45">
+  <rect x="292" y="588" width="46" height="46" rx="6"/><rect x="299" y="581" width="46" height="46" rx="6"/>
+  <rect x="306" y="574" width="46" height="46" rx="6"/><rect x="313" y="567" width="46" height="46" rx="6"/>
+</g>
+<g stroke="#22d3ee" stroke-opacity=".30" stroke-width=".8">
+  <path d="M324.5 567v46M336 567v46M347.5 567v46M313 578.5h46M313 590h46M313 601.5h46"/>
+</g>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#cbd5e1">
+  <text x="380" y="576">α  exp(-5·σ(·)), per key channel</text>
+  <text x="380" y="592">β  σ(W x), per head</text>
+  <text x="380" y="608">q, k  L2-normalized</text>
+  <text x="380" y="624">out  W_o(σ(W_g x) ⊙ RMSNorm(o))</text>
+</g>
+<rect x="292" y="650" width="292" height="48" rx="10" fill="#22d3ee" fill-opacity=".10" stroke="#22d3ee" stroke-opacity=".28"/>
+<text x="438" y="670" text-anchor="middle" font-size="11" font-weight="700" fill="#a5f3fc">the state never grows</text>
+<text x="438" y="688" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#cbd5e1">4 × 32 × 32 = 4,096 numbers, at T = 1 or T = 1M</text>
+
+<!-- ══════════ BAND 2 · P3 · depth attention ══════════ -->
+<rect x="612" y="410" width="222" height="300" rx="16" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".11"/>
+<text x="628" y="438" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" letter-spacing=".8" fill="#fde68a">DEPTH · ATTENTION RESIDUALS</text>
+<text x="628" y="454" font-size="10" fill="#94a3b8">Eqs. 8–10 · full retrieval over depth</text>
+
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="9.5" fill="#94a3b8" text-anchor="middle">
+  <text x="673" y="470">emb</text><text x="699" y="470">C0</text><text x="725" y="470">C1</text><text x="751" y="470">C2</text><text x="777" y="470">C3</text>
+</g>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#fcd34d" text-anchor="end">
+  <text x="654" y="495">q0</text><text x="654" y="521">q1</text><text x="654" y="547">q2</text><text x="654" y="573">q3</text><text x="654" y="599">q4</text>
+</g>
+<rect x="660" y="478" width="130" height="130" rx="6" fill="none" stroke="#ffffff" stroke-opacity=".10"/>
+<g fill="#ffffff" fill-opacity=".04" stroke="#ffffff" stroke-opacity=".07">
+  <rect x="689" y="481" width="20" height="20" rx="5"/><rect x="715" y="481" width="20" height="20" rx="5"/><rect x="741" y="481" width="20" height="20" rx="5"/><rect x="767" y="481" width="20" height="20" rx="5"/>
+  <rect x="715" y="507" width="20" height="20" rx="5"/><rect x="741" y="507" width="20" height="20" rx="5"/><rect x="767" y="507" width="20" height="20" rx="5"/>
+  <rect x="741" y="533" width="20" height="20" rx="5"/><rect x="767" y="533" width="20" height="20" rx="5"/>
+  <rect x="767" y="559" width="20" height="20" rx="5"/>
+</g>
+<g fill="#fbbf24" fill-opacity=".72">
+  <rect x="663" y="481" width="20" height="20" rx="5"/>
+  <rect x="663" y="507" width="20" height="20" rx="5"/><rect x="689" y="507" width="20" height="20" rx="5"/>
+  <rect x="663" y="533" width="20" height="20" rx="5"/><rect x="689" y="533" width="20" height="20" rx="5"/><rect x="715" y="533" width="20" height="20" rx="5"/>
+  <rect x="663" y="559" width="20" height="20" rx="5"/><rect x="689" y="559" width="20" height="20" rx="5"/><rect x="715" y="559" width="20" height="20" rx="5"/><rect x="741" y="559" width="20" height="20" rx="5"/>
+  <rect x="663" y="585" width="20" height="20" rx="5"/><rect x="689" y="585" width="20" height="20" rx="5"/><rect x="715" y="585" width="20" height="20" rx="5"/><rect x="741" y="585" width="20" height="20" rx="5"/><rect x="767" y="585" width="20" height="20" rx="5"/>
+</g>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">
+  <text x="628" y="628">row = depth query, col = source</text>
+  <text x="628" y="642">softmax runs over the lit cells</text>
+</g>
+<rect x="628" y="654" width="190" height="44" rx="10" fill="#fbbf24" fill-opacity=".10" stroke="#fbbf24" stroke-opacity=".28"/>
+<text x="723" y="672" text-anchor="middle" font-size="10.5" font-weight="700" fill="#fde68a">5 learned queries</text>
+<text x="723" y="689" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#cbd5e1">depth_queries [layers+1, 128]</text>
+
+<!-- ══════════ BAND 2 · P4 · Stable LatentMoE ══════════ -->
+<rect x="848" y="410" width="300" height="300" rx="16" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".11"/>
+<text x="864" y="438" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5" letter-spacing="1.2" fill="#fbcfe8">WIDTH · STABLE LATENTMOE</text>
+<text x="864" y="454" font-size="10" fill="#94a3b8">layers 1–3 · Eqs. 11–14</text>
+
+<path d="M921 475H884v155h111" fill="none" stroke="#34d399" stroke-opacity=".6" stroke-width="1.4" marker-end="url(#aE)"/>
+<text transform="rotate(-90 876 552)" x="876" y="552" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="9.5" fill="#6ee7b7">shared SiTU-GLU · 128 wide</text>
+<g stroke="#f472b6" stroke-opacity=".7" stroke-width="1.6" fill="none" marker-end="url(#aP)">
+  <path d="M1016 485v8"/><path d="M1016 515v6"/><path d="M1016 583v8"/><path d="M1016 613v6"/><path d="M1016 641v7"/>
+</g>
+<g text-anchor="middle">
+  <rect x="921" y="466" width="190" height="18" rx="9" fill="#ffffff" fill-opacity=".07" stroke="#ffffff" stroke-opacity=".16"/>
+  <text x="1016" y="479" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#cbd5e1">x  [B, T, 128]</text>
+
+  <rect x="908" y="494" width="216" height="20" rx="8" fill="#f472b6" fill-opacity=".10" stroke="#f472b6" stroke-opacity=".35"/>
+  <text x="1016" y="508" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#e2e8f0">down:  128 → 64</text>
+
+  <rect x="908" y="522" width="216" height="20" rx="8" fill="#f472b6" fill-opacity=".10" stroke="#f472b6" stroke-opacity=".35"/>
+  <text x="1016" y="536" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#e2e8f0">router  σ(W x) + router_bias</text>
+
+  <text x="1016" y="557" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">8 experts, top-2 · SiTU-GLU(64→192→64)</text>
+
+  <rect x="908" y="592" width="216" height="20" rx="8" fill="#f472b6" fill-opacity=".10" stroke="#f472b6" stroke-opacity=".35"/>
+  <text x="1016" y="606" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#e2e8f0">Σ w·E(z) → RMSNorm → up: 128</text>
+
+  <circle cx="1016" cy="630" r="10" fill="#0b1030" stroke="#94a3b8" stroke-opacity=".6"/>
+  <text x="1016" y="634" font-size="12" fill="#e2e8f0">+</text>
+
+  <rect x="908" y="650" width="216" height="20" rx="8" fill="#ffffff" fill-opacity=".07" stroke="#ffffff" stroke-opacity=".16"/>
+  <text x="1016" y="664" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#e2e8f0">shared(x) + up(norm(routed))</text>
+
+  <text x="1016" y="686" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">bias shifts dispatch, not weights</text>
+  <text x="1016" y="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#94a3b8">bias ← −quantile(scores − cutoff, .75)</text>
+</g>
+<g stroke="#f472b6" stroke-opacity=".35" fill="#f472b6" fill-opacity=".12">
+  <circle cx="925" cy="574" r="8"/><circle cx="951" cy="574" r="8"/><circle cx="1003" cy="574" r="8"/>
+  <circle cx="1029" cy="574" r="8"/><circle cx="1055" cy="574" r="8"/><circle cx="1107" cy="574" r="8"/>
+</g>
+<g filter="url(#gl)"><circle cx="977" cy="574" r="8" fill="#f472b6"/><circle cx="1081" cy="574" r="8" fill="#f472b6"/></g>
+
+<!-- ══════════ BAND 3 · P5 · decoding memory ══════════ -->
+<rect x="32" y="726" width="420" height="146" rx="16" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".11"/>
+<text x="48" y="752" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5" letter-spacing="1.2" fill="#a5f3fc">DECODING · WHAT GROWS, WHAT DOES NOT</text>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5">
+  <circle cx="54" cy="784" r="5" fill="#22d3ee"/>
+  <text x="70" y="788" fill="#a5f3fc">KDA state</text><text x="160" y="788" fill="#cbd5e1">[B, 4, 32, 32]</text><text x="280" y="788" fill="#e2e8f0">= 4,096, forever</text>
+  <circle cx="54" cy="808" r="5" fill="#60a5fa"/>
+  <text x="70" y="812" fill="#bfdbfe">global K/V</text><text x="160" y="812" fill="#cbd5e1">[B, 4, T, 32] ×2</text><text x="280" y="812" fill="#e2e8f0">= 256·T, grows</text>
+</g>
+<text x="48" y="840" font-size="10.5" fill="#94a3b8">At T = 1,024 the one global layer caches 262,144 numbers;</text>
+<text x="48" y="856" font-size="10.5" fill="#94a3b8">the three KDA states together still hold 12,288.</text>
+
+<!-- ══════════ BAND 3 · P6 · optimizer ══════════ -->
+<rect x="466" y="726" width="340" height="146" rx="16" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".11"/>
+<text x="482" y="752" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5" letter-spacing="1.2" fill="#ddd6fe">OPTIMIZER · PER-HEAD MUON</text>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10">
+  <text x="482" y="774" fill="#ddd6fe">matrices → per-head Muon</text>
+  <text x="790" y="774" text-anchor="end" fill="#94a3b8">Newton–Schulz, 5 steps</text>
+  <g fill="#cbd5e1"><text x="498" y="794">qkv.weight</text><text x="498" y="810">mix gate, decay</text><text x="498" y="826">all other matrices</text></g>
+  <g fill="#94a3b8" text-anchor="end"><text x="790" y="794">blocks = 3 × heads = 12</text><text x="790" y="810">blocks = heads = 4</text><text x="790" y="826">blocks = 1</text></g>
+  <text x="482" y="848" fill="#ddd6fe">embedding, depth queries, gains, biases</text>
+  <text x="482" y="862" fill="#94a3b8">→ AdamW, no decay · 1% warmup, then cosine</text>
+</g>
+
+<!-- ══════════ BAND 3 · P7 · scale ══════════ -->
+<rect x="820" y="726" width="328" height="146" rx="16" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".11"/>
+<text x="836" y="752" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5" letter-spacing="1.2" fill="#fbcfe8">SAME SHAPE, TEACHING SCALE</text>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="10">
+  <text x="1030" y="772" text-anchor="end" fill="#67e8f9">microK3</text>
+  <text x="1136" y="772" text-anchor="end" fill="#c4b5fd">Kimi K3</text>
+  <g fill="#94a3b8"><text x="836" y="790">layers</text><text x="836" y="804">KDA : global</text><text x="836" y="818">routed experts</text><text x="836" y="832">top-k</text><text x="836" y="846">train window</text><text x="836" y="860">parameters</text></g>
+  <g fill="#e2e8f0" text-anchor="end">
+    <text x="1030" y="790">4</text><text x="1030" y="804">3 : 1</text><text x="1030" y="818">8</text><text x="1030" y="832">2</text><text x="1030" y="846">128 B</text><text x="1030" y="860">1.65 M</text>
+  </g>
+  <g fill="#cbd5e1" text-anchor="end">
+    <text x="1136" y="790">93</text><text x="1136" y="804">3 : 1</text><text x="1136" y="818">896</text><text x="1136" y="832">16</text><text x="1136" y="846">1,048,576</text><text x="1136" y="860">2.8 T</text>
+  </g>
+</g>
 </svg>

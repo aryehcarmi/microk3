@@ -27,7 +27,9 @@ attention, **Attention Residuals** across depth, and a **Stable LatentMoE** acro
 official implementation needs industrial infrastructure. This repository turns the conceptual
 spine into one hackable file, one diagram, and a small regression suite.
 
-![Diagram of sequence, depth, and width information flow in microK3](assets/architecture.svg)
+![microK3 on one page: the forward pass over a depth bus, the KDA recurrence, the depth-attention
+pattern, Stable LatentMoE routing, decoding memory, the optimizer split, and the scale gap to Kimi
+K3](assets/architecture.svg)
 
 ## Five-minute tour
 
