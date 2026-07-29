@@ -16,7 +16,7 @@
 </div>
 
 > [!IMPORTANT]
-> **microK3 is K3-inspired, not Kimi K3.** It is a ~1.96M-parameter teaching model, not a
+> **microK3 is K3-inspired, not Kimi K3.** It is a ~1.65M-parameter teaching model, not a
 > reproduction or distillation. It never downloads the 2.8T-parameter weights. The goal is the
 > Karpathy-style feeling of seeing the whole learning system—not benchmark parity.
 
@@ -41,7 +41,7 @@ pytest -q
 microk3 --steps 20
 ```
 
-The test run should report `18 passed`. The first training loss should be near the uniform
+The test run should report `26 passed`. The first training loss should be near the uniform
 byte-token baseline `ln(256) ≈ 5.55`; an initial loss in the tens or hundreds is a bug, not a
 learning challenge.
 
@@ -54,8 +54,9 @@ microk3 --data path/to/tiny.txt --steps 1000
 The file must contain at least `block_size + 1` bytes—129 bytes at the default setting, though a
 larger corpus is much more useful. Use `--block-size 64` for a faster CPU experiment. Training
 prints a sample at the end; it intentionally does not create a checkpoint or background job.
-Use `--generate 0` for a train-only run. Run `microk3 --help` to see the batch size, learning rate,
-prompt, temperature, and device controls.
+Use `--generate 0` for a train-only run. Training defaults to the per-head Muon step with a warmup
+then cosine schedule; `--optimizer adamw` switches back. Run `microk3 --help` to see the batch
+size, learning rate, optimizer, prompt, temperature, and device controls.
 
 Read [`microk3.py`](microk3.py) top to bottom. The suggested path is:
 
@@ -67,6 +68,10 @@ Read [`microk3.py`](microk3.py) top to bottom. The suggested path is:
    and update dispatch biases with an exact batch-local version of Quantile Balancing.
 4. `MicroK3._mix_depth`: full AttnRes-style retrieval over the embedding and individual layer
    contributions, with a separate final-output query.
+5. `LayerCache` → `MicroK3.generate`: prefill once, then decode step by step. Every KDA state
+   stays the same size forever; only the global layers' caches grow with the sequence.
+6. `orthogonalize` → `Muon` → `build_optimizers`: K3's per-head orthogonalized step for matrix
+   weights, with an undecayed AdamW tail for embeddings, gains, and biases.
 
 ## What is faithful?
 
@@ -80,8 +85,11 @@ Read [`microk3.py`](microk3.py) top to bottom. The suggested path is:
 | Global attention | Gated MLA, NoPE | Gated MHA, no positional embeddings | 🟡 substituted |
 | Attention Residuals | Eight block-level groups with partial sums | Full attention over every layer contribution | 🟡 small-scale form |
 | Stable LatentMoE | 896 routed, top-16, 2 shared, latent width 3,584 | 8 routed, top-2, 1 shared, latent width 64 | 🟡 scaled down |
+| First dense layer | `first_k_dense_replace=1`, then 92 MoE layers | `dense_layers=1`, then MoE blocks | 🟢 pattern |
 | Quantile Balancing | Global histogram estimate, applied next batch | Exact local-batch quantile, applied next forward | 🟡 scaled down |
 | SiTU-GLU | β₁=4, β₂=25 | β₁=4, β₂=25 | 🟢 equation |
+| Optimizer | Per-Head Muon with QK-clip; 1% warmup, cosine decay, weight decay 0.1 | Per-head Muon on matrices, AdamW tail, same schedule shape; no QK-clip | 🟡 scaled down |
+| Decoding | Fused kernels; constant KDA state, compressed MLA cache | Same state-versus-cache split in a plain prefill + step loop | 🟢 pattern |
 | Context and tokens | 1,048,576 learned-token context | 128 raw bytes by default | 🟡 teaching scale |
 | Vision | 401M-parameter MoonViT-V2 | Absent | ⚪ out of scope |
 | Native quantization | MXFP4 expert weights / MXFP8 activations with QAT | Standard PyTorch precision | ⚪ out of scope |
@@ -89,8 +97,9 @@ Read [`microk3.py`](microk3.py) top to bottom. The suggested path is:
 The KDA path deliberately omits ShortConv, Swish projections, low-rank decay projection, and the
 chunkwise fused algorithm. The global layer is not MLA. Quantile Balancing is exact only over the
 local teaching batch, not a distributed global histogram. These boundaries are explicit; tests
-cover the recurrence’s numerical behavior, causality, routing counts, next-step bias update,
-initialization scale, valid configuration, generation guardrails, and corpus-window boundaries.
+cover the recurrence’s numerical behavior, causality, cached-decoding equivalence, routing counts,
+next-step bias update, optimizer parameter grouping, initialization scale, valid configuration,
+generation guardrails, and corpus-window boundaries.
 
 One subtle experiment: with `top_k=1`, the normalized selected router weight is exactly one, so the
 router receives essentially no gradient through mixture weights. K3 uses top-16. Treat top-1 here
@@ -105,6 +114,7 @@ as a demonstration of that failure mode, not as a recommended setting.
 | §2.2, Eqs. 8–10 | `MicroK3._mix_depth` and `Block.forward` | Learned pseudo-query, normalized keys, softmax over prior contributions | Block grouping and intra-block partial sums |
 | §2.3, Eqs. 11–12 | `StableLatentMoE` and `SiTUGLU` | Latent routed path, pre-up RMSNorm, bounded GLU, shared path | Report-scale widths and second shared expert |
 | §2.3.3, Eqs. 13–14 | `StableLatentMoE._update_router_bias` | Bias only affects dispatch; quantile bias is used on the next pass | Distributed histogram approximation |
+| §2.5 and §3.3 | `orthogonalize`, `Muon`, `build_optimizers` | Per-head Newton–Schulz step, matrix/tail split, 1% warmup + cosine shape | QK-clip, distributed sharding, report-scale tuning |
 
 Default tensor shapes make the scale reduction concrete:
 
@@ -149,13 +159,16 @@ and availability change, so check Modal before launching. The K3 weights are nev
 
 ## Experiments worth trying
 
-- Plot `block.moe.last_load` and `block.moe.router_bias`; which experts specialize, and how quickly
-  does the local Quantile Balancing update respond?
+- Plot `block.ffn.last_load` and `block.ffn.router_bias` for an MoE block; which experts
+  specialize, and how quickly does the local Quantile Balancing update respond?
 - Disable `_update_router_bias` for one run and compare expert loads.
 - Change `top_k` from 2 → 1 and confirm why the normalized router-weight gradient disappears.
 - Replace the bounded decay with an unbounded softplus decay and inspect long-prefix retention.
 - Add the omitted ShortConv + Swish projections, then compare the tensor trace.
-- Replace `GatedAttention` with a true latent KV cache and measure memory.
+- Train the same seed with `--optimizer adamw` and compare its loss curve against per-head Muon.
+- Generate far past `--block-size` and watch the global caches grow while every KDA state stays
+  the same size.
+- Compress the global layers' plain KV cache into a small latent, as MLA does, and measure memory.
 
 ## Development
 

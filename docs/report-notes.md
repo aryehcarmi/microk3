@@ -28,6 +28,9 @@ They were checked on 2026-07-28 UTC.
 - Quantile Balancing adds per-expert biases only to Top-k dispatch. Mixture weights use unbiased
   sigmoid scores. The next-step bias is the negative `(1 - k/n)` quantile of each expert's margin
   over the current Top-(k+1) cutoff, centered to zero mean.
+- Matrices train with Per-Head Muon: Newton–Schulz orthogonalization applied per attention head's
+  block, keeping K2's weight-clipping mechanism, with cosine decay after a 1% linear warmup and
+  weight decay 0.1. Peak learning rates, batch sizes, and total token counts are not published.
 - The 401M-parameter, 27-layer MoonViT-V2 is trained from scratch with next-token prediction.
 - The release reports MXFP4 routed-expert weights and MXFP8 input activations from
   quantization-aware training. This is not post-training quantization of the whole model.
@@ -42,7 +45,11 @@ They were checked on 2026-07-28 UTC.
 - a 3:1 hybrid schedule with a guaranteed global final layer;
 - AttnRes-style retrieval over the embedding and separate layer contributions;
 - a latent routed path, pre-up RMSNorm, a full-width shared path, and the SiTU constants;
-- bias-separated routing weights and an exact, batch-local next-step Quantile Balancing update.
+- bias-separated routing weights and an exact, batch-local next-step Quantile Balancing update;
+- a dense first layer before the routed stack;
+- per-head Muon on matrix weights, an undecayed AdamW tail, and the warmup-then-cosine schedule
+  shape;
+- decoding that carries a fixed-size KDA state while only global layers append keys and values.
 
 It deliberately changes:
 
@@ -53,6 +60,8 @@ It deliberately changes:
 - eight block-level AttnRes groups to full attention over four individual layer contributions;
 - distributed histogram Quantile Balancing to `torch.quantile` on the current local batch;
 - 896/top-16/two-shared routing to 8/top-2/one-shared routing;
+- QK-clip and the distributed Muon implementation to a bare batched Newton–Schulz step;
+- unpublished report-scale learning rates and batch sizes to small fixed defaults;
 - learned subword tokens to raw bytes.
 
 It omits vision, native quantization, million-token execution, multimodal projection, MTP,

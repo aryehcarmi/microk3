@@ -27,6 +27,7 @@ class Config:
     heads: int = 4
     experts: int = 8
     top_k: int = 2
+    dense_layers: int = 1
     block_size: int = 128
     dropout: float = 0.0
 
@@ -50,6 +51,8 @@ class Config:
             raise ValueError(f"dim ({self.dim}) must be divisible by heads ({self.heads})")
         if not 1 <= self.top_k <= self.experts:
             raise ValueError(f"top_k must be between 1 and experts ({self.experts}), got {self.top_k}")
+        if not 0 <= self.dense_layers <= self.layers:
+            raise ValueError(f"dense_layers must be in [0, layers ({self.layers})], got {self.dense_layers}")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
 
@@ -61,6 +64,19 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.weight * F.rms_norm(x, (x.size(-1),))
+
+
+@dataclass
+class LayerCache:
+    """One layer's decoding memory: a KDA recurrent state or a global-attention history.
+
+    KDA's ``state`` stays the same size forever; only the global layers grow with the
+    prompt. That asymmetry is the whole point of a 3:1 hybrid, so it is worth watching.
+    """
+
+    state: torch.Tensor | None = None
+    keys: torch.Tensor | None = None
+    values: torch.Tensor | None = None
 
 
 def delta_rule_step(
@@ -99,7 +115,7 @@ class KimiDeltaAttention(nn.Module):
         self.out = nn.Linear(cfg.dim, cfg.dim, bias=False)
         self.norm = RMSNorm(self.head_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: LayerCache | None = None) -> torch.Tensor:
         b, t, _ = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(b, t, self.heads, self.head_dim)
@@ -113,11 +129,15 @@ class KimiDeltaAttention(nn.Module):
         decay_scale = self.log_decay_scale.exp().view(1, 1, self.heads, 1)
         alpha = torch.exp(-5.0 * torch.sigmoid(decay_scale * decay_logits)).unsqueeze(-1)
         beta = torch.sigmoid(self.beta(x)).unsqueeze(-1)
-        state = x.new_zeros(b, self.heads, self.head_dim, self.head_dim)
+        state = None if cache is None else cache.state
+        if state is None:
+            state = x.new_zeros(b, self.heads, self.head_dim, self.head_dim)
         outputs = []
         for i in range(t):
             state, output = delta_rule_step(state, k[:, i], v[:, i], q[:, i], alpha[:, i], beta[:, i])
             outputs.append(output)
+        if cache is not None:
+            cache.state = state
         y = torch.stack(outputs, dim=1)
         y = self.norm(y).reshape(b, t, -1)
         return self.out(torch.sigmoid(self.gate(x)) * y)
@@ -133,11 +153,18 @@ class GatedAttention(nn.Module):
         self.gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
         self.out = nn.Linear(cfg.dim, cfg.dim, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: LayerCache | None = None) -> torch.Tensor:
         b, t, _ = x.shape
         q, k, v = self.qkv(x).view(b, t, 3, self.heads, self.head_dim).unbind(2)
         q, k, v = (z.transpose(1, 2) for z in (q, k, v))
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if cache is not None:
+            k = k if cache.keys is None else torch.cat((cache.keys, k), dim=2)
+            v = v if cache.values is None else torch.cat((cache.values, v), dim=2)
+            cache.keys, cache.values = k, v
+        # New queries sit at the end of the cached history, so the mask shifts with it.
+        offset = k.size(2) - q.size(2)
+        window = None if offset == 0 else q.new_ones(q.size(2), k.size(2), dtype=torch.bool).tril(offset)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=window, is_causal=window is None)
         y = y.transpose(1, 2).reshape(b, t, -1)
         return self.out(torch.sigmoid(self.gate(x)) * y)
 
@@ -150,8 +177,10 @@ class SiTUGLU(nn.Module):
         self.down = nn.Linear(hidden, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Eq. 12: bounded gate and value branches (|product| <= 100).
-        g = 4 * torch.tanh(self.gate(x) / 4) * torch.sigmoid(self.gate(x))
+        # Eq. 12: bounded gate and value branches (|product| <= 100). The sigmoid reads the
+        # uncapped pre-activation, so soft-capping never flattens the gate's own slope.
+        pre = self.gate(x)
+        g = 4 * torch.tanh(pre / 4) * torch.sigmoid(pre)
         u = 25 * torch.tanh(self.up(x) / 25)
         return self.down(g * u)
 
@@ -192,6 +221,8 @@ class StableLatentMoE(nn.Module):
         weights = scores * mask
         weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-9)
         z = self.down(x)
+        # K3 dispatches tokens to their Top-k experts; we run every expert densely and mask
+        # afterwards, which is the same function and much easier to read (and much slower).
         routed = sum(weights[..., i, None] * expert(z) for i, expert in enumerate(self.experts))
         self.last_load = mask.detach().sum((0, 1))
         if self.training and cutoff is not None:
@@ -200,17 +231,19 @@ class StableLatentMoE(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, cfg: Config, global_attention: bool):
+    def __init__(self, cfg: Config, global_attention: bool, dense: bool):
         super().__init__()
         self.norm1, self.norm2 = RMSNorm(cfg.dim), RMSNorm(cfg.dim)
         self.mix = GatedAttention(cfg) if global_attention else KimiDeltaAttention(cfg)
-        self.moe = StableLatentMoE(cfg)
+        # K3 sets first_k_dense_replace=1: the first layer is a plain FFN, so the router
+        # never has to learn dispatch from a barely-shaped embedding stream.
+        self.ffn = SiTUGLU(cfg.dim, cfg.expert_hidden) if dense else StableLatentMoE(cfg)
         self.dropout = nn.Dropout(cfg.dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: LayerCache | None = None) -> torch.Tensor:
         """Return this layer's contribution, not a cumulative residual state."""
-        mixed = self.dropout(self.mix(self.norm1(x)))
-        routed = self.dropout(self.moe(self.norm2(x + mixed)))
+        mixed = self.dropout(self.mix(self.norm1(x), cache))
+        routed = self.dropout(self.ffn(self.norm2(x + mixed)))
         return mixed + routed
 
 
@@ -221,7 +254,8 @@ class MicroK3(nn.Module):
         self.token = nn.Embedding(cfg.vocab_size, cfg.dim)
         # K3 repeats 3 KDA : 1 global attention and always ends globally.
         self.blocks = nn.ModuleList(
-            Block(cfg, (i + 1) % 4 == 0 or i == cfg.layers - 1) for i in range(cfg.layers)
+            Block(cfg, (i + 1) % 4 == 0 or i == cfg.layers - 1, i < cfg.dense_layers)
+            for i in range(cfg.layers)
         )
         self.depth_queries = nn.Parameter(torch.zeros(cfg.layers + 1, cfg.dim))
         self.norm = RMSNorm(cfg.dim)
@@ -237,8 +271,15 @@ class MicroK3(nn.Module):
             if getattr(module, "bias", None) is not None:
                 nn.init.zeros_(module.bias)
 
+    def caches(self) -> list[LayerCache]:
+        """Fresh decoding memory, one slot per layer."""
+        return [LayerCache() for _ in self.blocks]
+
     def forward(
-        self, tokens: torch.Tensor, targets: torch.Tensor | None = None
+        self,
+        tokens: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        caches: list[LayerCache] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] == 0:
             raise ValueError(f"tokens must have non-empty [batch, time] shape, got {tuple(tokens.shape)}")
@@ -250,10 +291,12 @@ class MicroK3(nn.Module):
             )
         if targets is not None and targets.dtype not in (torch.int32, torch.int64):
             raise ValueError(f"targets must use an integer dtype, got {targets.dtype}")
+        if caches is not None and len(caches) != len(self.blocks):
+            raise ValueError(f"expected {len(self.blocks)} caches, got {len(caches)}")
         sources = [self.token(tokens)]
         for i, block in enumerate(self.blocks):
             x = self._mix_depth(self.depth_queries[i], sources)
-            sources.append(block(x))
+            sources.append(block(x, None if caches is None else caches[i]))
         final = self._mix_depth(self.depth_queries[-1], sources)
         logits = self.lm_head(self.norm(final))
         loss = None if targets is None else F.cross_entropy(logits.flatten(0, 1), targets.flatten())
@@ -282,11 +325,103 @@ class MicroK3(nn.Module):
             raise ValueError(
                 f"tokens must be in [0, {self.cfg.vocab_size}), got range [{minimum}, {maximum}]"
             )
+        if count == 0:
+            return tokens
+        # Prefill the prompt in one pass, then step token by token. Nothing here crops to
+        # block_size: with no positional encoding anywhere, the model runs at any length.
+        caches = self.caches()
+        logits, _ = self(tokens, caches=caches)
         for _ in range(count):
-            logits, _ = self(tokens[:, -self.cfg.block_size :])
             probs = (logits[:, -1] / temperature).softmax(-1)
-            tokens = torch.cat((tokens, torch.multinomial(probs, 1)), dim=1)
+            latest = torch.multinomial(probs, 1)
+            tokens = torch.cat((tokens, latest), dim=1)
+            logits, _ = self(latest, caches=caches)
         return tokens
+
+
+def orthogonalize(matrix: torch.Tensor, steps: int = 5) -> torch.Tensor:
+    """Newton-Schulz iteration that pushes every singular value toward one."""
+    a, b, c = 3.4445, -4.7750, 2.0315
+    x = matrix / (matrix.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    tall = x.size(-2) > x.size(-1)
+    if tall:
+        x = x.mT
+    for _ in range(steps):
+        gram = x @ x.mT
+        x = a * x + (b * gram + c * (gram @ gram)) @ x
+    return x.mT if tall else x
+
+
+class Muon(torch.optim.Optimizer):
+    """Per-head Muon: momentum, then an orthogonalized step for each head's own slice.
+
+    K3 trains matrices with Per-Head Muon and everything else with AdamW. ``blocks`` is
+    how many head-sized row groups a weight holds—fused Q/K/V holds three per head—so the
+    Newton-Schulz iteration runs batched over heads rather than over the whole matrix.
+    QK-clip, the other half of K3's optimizer, is not reproduced here.
+    """
+
+    def __init__(self, groups, lr: float = 0.02, momentum: float = 0.95, weight_decay: float = 0.0):
+        super().__init__(groups, dict(lr=lr, momentum=momentum, weight_decay=weight_decay, blocks=1))
+
+    @torch.no_grad()
+    def step(self) -> None:
+        for group in self.param_groups:
+            for parameter in group["params"]:
+                if parameter.grad is None:
+                    continue
+                state = self.state[parameter]
+                if "momentum" not in state:
+                    state["momentum"] = torch.zeros_like(parameter)
+                state["momentum"].lerp_(parameter.grad, 1 - group["momentum"])
+                # Nesterov-style lookahead, as in the reference Muon.
+                update = parameter.grad.lerp(state["momentum"], group["momentum"])
+                update = orthogonalize(update.view(group["blocks"], -1, parameter.size(-1)))
+                scale = max(1.0, update.size(-2) / update.size(-1)) ** 0.5
+                parameter.mul_(1 - group["lr"] * group["weight_decay"])
+                parameter.add_(update.reshape(parameter.shape), alpha=-group["lr"] * scale)
+
+
+def parameter_groups(model: MicroK3) -> tuple[dict[int, list[nn.Parameter]], list[nn.Parameter]]:
+    """Sort weights into head-aligned matrix groups and the scalar-ish remainder."""
+    heads: int = model.cfg.heads
+    matrices: dict[int, list[nn.Parameter]] = {}
+    others: list[nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if parameter.ndim < 2 or name in ("token.weight", "depth_queries"):
+            others.append(parameter)
+        elif name.endswith("qkv.weight"):
+            matrices.setdefault(3 * heads, []).append(parameter)
+        elif ".mix." in name and name.endswith(("gate.weight", "decay.weight")):
+            matrices.setdefault(heads, []).append(parameter)
+        else:
+            matrices.setdefault(1, []).append(parameter)
+    return matrices, others
+
+
+def build_optimizers(
+    model: MicroK3,
+    kind: str,
+    learning_rate: float,
+    muon_lr: float = 0.02,
+    weight_decay: float = 0.1,
+) -> list[torch.optim.Optimizer]:
+    """Matrices get Muon or AdamW; embeddings, gains and biases always get undecayed AdamW."""
+    matrices, others = parameter_groups(model)
+    tail = torch.optim.AdamW(others, lr=learning_rate, weight_decay=0.0)
+    if kind == "muon":
+        groups = [{"params": params, "blocks": blocks} for blocks, params in sorted(matrices.items())]
+        return [Muon(groups, lr=muon_lr, weight_decay=weight_decay), tail]
+    flat = [parameter for params in matrices.values() for parameter in params]
+    return [torch.optim.AdamW(flat, lr=learning_rate, weight_decay=weight_decay), tail]
+
+
+def learning_rate_scale(step: int, total: int, warmup: float = 0.01) -> float:
+    """K3's schedule shape: a 1% linear warmup, then cosine decay."""
+    warmup_steps = max(1, round(total * warmup))
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    return 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / max(1, total - warmup_steps)))
 
 
 def corpus(path: str | None) -> bytes:
@@ -322,7 +457,10 @@ def default_device() -> str:
 
 
 def available_device(value: str) -> str:
-    device = torch.device(value)
+    try:
+        device = torch.device(value)
+    except RuntimeError as error:  # argparse renders this as a one-line usage error
+        raise argparse.ArgumentTypeError(str(error)) from None
     if device.type == "cuda" and not torch.cuda.is_available():
         raise argparse.ArgumentTypeError("CUDA was requested, but no CUDA device is available")
     if device.type == "mps" and not torch.backends.mps.is_available():
@@ -366,6 +504,15 @@ def main() -> None:
     p.add_argument("--block-size", type=positive_int, default=128)
     p.add_argument("--learning-rate", type=positive_float, default=3e-4)
     p.add_argument(
+        "--optimizer",
+        choices=("adamw", "muon"),
+        default="muon",
+        help="muon runs K3's per-head orthogonalized step on matrices",
+    )
+    p.add_argument(
+        "--muon-lr", type=positive_float, default=0.02, help="matrix step size for --optimizer muon"
+    )
+    p.add_argument(
         "--generate",
         type=non_negative_int,
         default=120,
@@ -392,23 +539,30 @@ def main() -> None:
             f"corpus has {data.numel()} bytes; use at least {cfg.block_size + 1} bytes "
             "or choose a smaller --block-size"
         )
-    opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizers = build_optimizers(model, args.optimizer, args.learning_rate, args.muon_lr)
+    schedules = [
+        torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: learning_rate_scale(step, args.steps))
+        for optimizer in optimizers
+    ]
     count = sum(parameter.numel() for parameter in model.parameters())
     python_version = ".".join(map(str, sys.version_info[:3]))
     print(
         f"{styled('◆ microK3', 81)}  {count:,} parameters  {args.device}  "
         f"python {python_version}  torch {torch.__version__}  seed {args.seed}  "
-        f"block {cfg.block_size}  batch {args.batch_size}"
+        f"block {cfg.block_size}  batch {args.batch_size}  {args.optimizer}"
     )
     model.train()
     for step in range(args.steps):
         x, y = sample_batch(data, cfg.block_size, args.batch_size)
         _, loss = model(x, y)
-        opt.zero_grad(set_to_none=True)
+        for optimizer in optimizers:
+            optimizer.zero_grad(set_to_none=True)
         assert loss is not None
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        for optimizer, schedule in zip(optimizers, schedules, strict=True):
+            optimizer.step()
+            schedule.step()
         if step % 10 == 0 or step == args.steps - 1:
             print(f"{styled(f'step {step:04d}', 213)}  loss {loss.item():.4f}")
     model.eval()
