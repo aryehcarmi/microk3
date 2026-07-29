@@ -502,7 +502,12 @@ def main() -> None:
     p.add_argument("--steps", type=positive_int, default=100)
     p.add_argument("--batch-size", type=positive_int, default=8)
     p.add_argument("--block-size", type=positive_int, default=128)
-    p.add_argument("--learning-rate", type=positive_float, default=3e-4)
+    p.add_argument(
+        "--learning-rate",
+        type=positive_float,
+        default=1e-3,
+        help="AdamW step size; with --optimizer muon it drives only the embedding and gain tail",
+    )
     p.add_argument(
         "--optimizer",
         choices=("adamw", "muon"),

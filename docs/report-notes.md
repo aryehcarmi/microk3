@@ -25,6 +25,7 @@ They were checked on 2026-07-28 UTC.
   pseudo-queries. K3 has eight layer blocks: seven full 12-layer blocks and one partial 9-layer
   block. Counting the embedding gives nine block-level sources.
 - SiTU-GLU soft-caps gate and up branches with `beta * tanh(x / beta)`; beta values are 4 and 25.
+- Input and output embeddings are untied (`tie_word_embeddings: false`).
 - Quantile Balancing adds per-expert biases only to Top-k dispatch. Mixture weights use unbiased
   sigmoid scores. The next-step bias is the negative `(1 - k/n)` quantile of each expert's margin
   over the current Top-(k+1) cutoff, centered to zero mean.
@@ -62,6 +63,7 @@ It deliberately changes:
 - 896/top-16/two-shared routing to 8/top-2/one-shared routing;
 - QK-clip and the distributed Muon implementation to a bare batched Newton–Schulz step;
 - unpublished report-scale learning rates and batch sizes to small fixed defaults;
+- untied input and output embeddings to one tied byte embedding and head;
 - learned subword tokens to raw bytes.
 
 It omits vision, native quantization, million-token execution, multimodal projection, MTP,

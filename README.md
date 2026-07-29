@@ -41,9 +41,15 @@ pytest -q
 microk3 --steps 20
 ```
 
-The test run should report `26 passed`. The first training loss should be near the uniform
+The test run should report `31 passed`. The first training loss should be near the uniform
 byte-token baseline `ln(256) ≈ 5.55`; an initial loss in the tens or hundreds is a bug, not a
-learning challenge.
+learning challenge. Twenty steps is enough to watch that number fall and nothing more—the sample
+printed at the end is still byte noise, and stays noise until a few hundred steps on a real corpus.
+
+On an Apple M2 laptop with torch 2.10, that quickstart takes about 9 seconds on CPU: roughly 2.5
+training steps per second, plus a 120-byte sample. `--device mps` trains a shade faster and samples
+about three times slower, because the KDA token loop launches many small kernels and pays a
+one-time shader compilation on its first run. At this scale either device is fine.
 
 Bring a text, code, or arbitrary byte corpus:
 
@@ -73,6 +79,10 @@ Read [`microk3.py`](microk3.py) top to bottom. The suggested path is:
 6. `orthogonalize` → `Muon` → `build_optimizers`: K3's per-head orthogonalized step for matrix
    weights, with an undecayed AdamW tail for embeddings, gains, and biases.
 
+Model shape—`layers`, `dim`, `experts`, `top_k`, `dense_layers`—is deliberately not exposed as CLI
+flags. Edit the `Config` defaults at the top of `microk3.py` so every change stays visible in the
+file you are reading.
+
 ## What is faithful?
 
 | Idea | Kimi K3 | microK3 | Status |
@@ -91,6 +101,7 @@ Read [`microk3.py`](microk3.py) top to bottom. The suggested path is:
 | Optimizer | Per-Head Muon with QK-clip; 1% warmup, cosine decay, weight decay 0.1 | Per-head Muon on matrices, AdamW tail, same schedule shape; no QK-clip | 🟡 scaled down |
 | Decoding | Fused kernels; constant KDA state, compressed MLA cache | Same state-versus-cache split in a plain prefill + step loop | 🟢 pattern |
 | Context and tokens | 1,048,576 learned-token context | 128 raw bytes by default | 🟡 teaching scale |
+| Embeddings | Untied input and output embeddings | One tied byte embedding and head | 🟡 scaled down |
 | Vision | 401M-parameter MoonViT-V2 | Absent | ⚪ out of scope |
 | Native quantization | MXFP4 expert weights / MXFP8 activations with QAT | Standard PyTorch precision | ⚪ out of scope |
 
@@ -129,8 +140,9 @@ depth sources                  embedding + one contribution per completed layer
 
 ## Model archaeology without a 1.5 TB accident
 
-The report and repository appeared on July 27, 2026. The metadata helper lists remote filenames
-and performs HEAD requests for weight sizes; it has no file-download call and writes nothing:
+Moonshot AI announced K3 on July 16, 2026; the public repository and technical report followed on
+July 27. The metadata helper lists remote filenames and performs HEAD requests for weight sizes;
+it has no file-download call and writes nothing:
 
 ```bash
 pip install -e '.[inspect]'
@@ -153,9 +165,11 @@ modal setup
 modal run modal_train.py --steps 500
 ```
 
-It defaults to an L40S and the bundled corpus. Start at 100–500 steps, inspect Modal's live cost
-dashboard, then scale consciously. **A free-credit balance is not a spending guarantee**; pricing
-and availability change, so check Modal before launching. The K3 weights are never fetched.
+It defaults to an L40S and the bundled corpus. `--batch-size`, `--block-size`, and `--optimizer`
+pass through, and `--data path/to/tiny.txt` ships a corpus of up to 8 MiB with the run; anything
+larger belongs in a Modal Volume. Start at 100–500 steps, inspect Modal's live cost dashboard,
+then scale consciously. **A free-credit balance is not a spending guarantee**; pricing and
+availability change, so check Modal before launching. The K3 weights are never fetched.
 
 ## Experiments worth trying
 
@@ -165,7 +179,11 @@ and availability change, so check Modal before launching. The K3 weights are nev
 - Change `top_k` from 2 → 1 and confirm why the normalized router-weight gradient disappears.
 - Replace the bounded decay with an unbounded softplus decay and inspect long-prefix retention.
 - Add the omitted ShortConv + Swish projections, then compare the tensor trace.
-- Train the same seed with `--optimizer adamw` and compare its loss curve against per-head Muon.
+- Train the same seed with `--optimizer adamw` and compare loss curves. At a matched learning rate
+  the two finish close together on this corpus; what Muon actually buys here is insensitivity to
+  that learning rate, so sweep `--muon-lr` from 0.005 to 0.05 and watch how little moves.
+- Raise and lower `--learning-rate` in `--optimizer muon` runs. It touches only the embedding and
+  gain tail, yet it moves the loss more than `--muon-lr` does: the tied byte head is the bottleneck.
 - Generate far past `--block-size` and watch the global caches grow while every KDA state stays
   the same size.
 - Compress the global layers' plain KV cache into a small latent, as MLA does, and measure memory.

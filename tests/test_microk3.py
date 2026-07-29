@@ -1,4 +1,6 @@
+import argparse
 import math
+import sys
 
 import pytest
 import torch
@@ -11,9 +13,11 @@ from microk3 import (
     MicroK3,
     SiTUGLU,
     StableLatentMoE,
+    available_device,
     build_optimizers,
     delta_rule_step,
     learning_rate_scale,
+    main,
     orthogonalize,
     parameter_groups,
     sample_batch,
@@ -153,6 +157,13 @@ def test_causal_prefix_is_unchanged_by_future_tokens():
     torch.testing.assert_close(ya[:, :4], yb[:, :4], atol=2e-5, rtol=2e-5)
 
 
+def test_depth_mixing_starts_uniform_over_sources():
+    """Zero depth queries mean AttnRes begins as a plain average of every source."""
+    sources = [torch.randn(2, 3, 4) for _ in range(3)]
+    mixed = MicroK3._mix_depth(torch.zeros(4), sources)
+    torch.testing.assert_close(mixed, sum(sources) / len(sources))
+
+
 def test_cached_decoding_matches_full_forward():
     torch.manual_seed(0)
     model = MicroK3(tiny_config()).eval()
@@ -181,6 +192,26 @@ def test_quantile_balancing_updates_next_step_bias_only_during_training():
     moe.eval()
     moe(x)
     torch.testing.assert_close(moe.router_bias, after)
+
+
+def test_router_bias_steers_dispatch_but_never_mixture_weights():
+    """The whole point of aux-loss-free balancing: bias picks experts, scores weight them."""
+    torch.manual_seed(0)
+    moe = StableLatentMoE(tiny_config()).eval()
+    x = torch.randn(2, 4, 16)
+    baseline = moe(x)
+
+    with torch.no_grad():
+        moe.router_bias.add_(3.0)
+    torch.testing.assert_close(moe(x), baseline)
+
+    starved = int(moe.last_load.argmin())
+    with torch.no_grad():
+        moe.router_bias.zero_()
+        moe.router_bias[starved] = 10.0
+    routed = moe(x)
+    assert moe.last_load[starved] == x.shape[0] * x.shape[1]
+    assert not torch.allclose(routed, baseline)
 
 
 def test_final_layer_is_always_global_attention():
@@ -258,3 +289,43 @@ def test_generation_validates_inputs_and_preserves_prompt():
         model.generate(torch.ones(1, 1), count=1)
     with pytest.raises(ValueError, match=r"\[0, 32\)"):
         model.generate(torch.tensor([[32]]), count=1)
+
+
+def test_unknown_device_is_an_argument_error_not_a_traceback():
+    with pytest.raises(argparse.ArgumentTypeError):
+        available_device("bogus")
+
+
+def cli(monkeypatch, *arguments: str) -> None:
+    monkeypatch.setattr(sys, "argv", ["microk3", "--device", "cpu", *arguments])
+    main()
+
+
+def test_cli_trains_and_samples_from_a_corpus(tmp_path, monkeypatch, capsys):
+    data = tmp_path / "tiny.txt"
+    data.write_bytes(b"microK3 predicts the next byte. " * 8)
+    cli(
+        monkeypatch,
+        "--data",
+        str(data),
+        "--steps",
+        "2",
+        "--block-size",
+        "16",
+        "--batch-size",
+        "2",
+        "--generate",
+        "8",
+        "--optimizer",
+        "muon",
+    )
+    printed = capsys.readouterr().out
+    assert "parameters" in printed
+    assert "step 0001" in printed
+
+
+def test_cli_explains_a_corpus_smaller_than_one_window(tmp_path, monkeypatch):
+    data = tmp_path / "small.txt"
+    data.write_bytes(b"too short")
+    with pytest.raises(SystemExit):
+        cli(monkeypatch, "--data", str(data), "--steps", "1", "--block-size", "16")

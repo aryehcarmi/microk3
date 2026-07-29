@@ -12,6 +12,11 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  # These runners have no GPU, so take the CPU-only torch wheels instead of the
+  # multi-gigabyte CUDA build PyPI serves by default.
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+
 jobs:
   test:
     runs-on: ubuntu-latest
