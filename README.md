@@ -175,10 +175,13 @@ describes. At the default shape that covers 884,736 of 1,645,496 weights, which 
 bytes against 3,538,944 in float32: 4.25 bits per weight, and a reminder that experts are where
 the memory lives.
 
-Four-bit experts cost little at this size. Two hundred steps on the bundled corpus at the default
-seed end at loss 0.047 with `--quantize` and 0.041 without. Read that as a smoke test rather than
-a scaling result: the bundled corpus is short enough to memorize, and a model this small has few
-weights whose precision is doing real work.
+Four-bit experts cost little at this size—little enough that the seed matters more than the format
+does. Two hundred steps on the bundled corpus end between 0.041 and 0.053 with `--quantize` and
+between 0.045 and 0.057 without, across seeds 0–3 and 42 on CPU. The spread within either setting
+is roughly six times the gap between their means, and `--quantize` finishes lower at three of those
+five seeds. Read that as a smoke test rather than a scaling result: the bundled corpus is short
+enough to memorize, and a model this small has few weights whose precision is doing real work. If
+you want a number that means something here, sweep `--seed` and compare distributions, not runs.
 
 ## Report-to-code map
 
