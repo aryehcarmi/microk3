@@ -461,6 +461,8 @@ def available_device(value: str) -> str:
         device = torch.device(value)
     except RuntimeError as error:  # argparse renders this as a one-line usage error
         raise argparse.ArgumentTypeError(str(error)) from None
+    if device.type not in {"cpu", "cuda", "mps"}:
+        raise argparse.ArgumentTypeError("device must be cpu, cuda, or mps")
     if device.type == "cuda" and not torch.cuda.is_available():
         raise argparse.ArgumentTypeError("CUDA was requested, but no CUDA device is available")
     if device.type == "mps" and not torch.backends.mps.is_available():
@@ -491,6 +493,17 @@ def positive_float(value: str) -> float:
 
 def styled(text: str, color: int) -> str:
     return f"\033[38;5;{color}m{text}\033[0m" if sys.stdout.isatty() else text
+
+
+def terminal_text(data: bytes) -> str:
+    """Decode arbitrary bytes while escaping terminal control characters."""
+    decoded = data.decode("utf-8", errors="replace")
+    return "".join(
+        character
+        if character in "\n\t" or character.isprintable()
+        else character.encode("unicode_escape").decode("ascii")
+        for character in decoded
+    )
 
 
 def main() -> None:
@@ -574,7 +587,7 @@ def main() -> None:
     if args.generate:
         seed = torch.tensor([list(prompt)], dtype=torch.long, device=args.device)
         sample = model.generate(seed, args.generate, args.temperature)[0].cpu().tolist()
-        print("\n" + bytes(sample).decode("utf-8", errors="replace"))
+        print("\n" + terminal_text(bytes(sample)))
 
 
 if __name__ == "__main__":

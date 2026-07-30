@@ -7,14 +7,14 @@ WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
 
 
 def main() -> None:
-    files = HfApi().list_repo_files(repo_id=REPO, repo_type="model")
+    files = HfApi(token=False).list_repo_files(repo_id=REPO, repo_type="model")
     print(f"{REPO}: {len(files)} remote files (metadata only)\n")
     total = 0
     weight_count = 0
     unknown_sizes = []
     for name in files:
         if name.endswith(WEIGHT_SUFFIXES):
-            metadata = get_hf_file_metadata(hf_hub_url(REPO, name))  # HEAD request, no body
+            metadata = get_hf_file_metadata(hf_hub_url(REPO, name), token=False)  # HEAD request, no body
             weight_count += 1
             if metadata.size is None:
                 unknown_sizes.append(name)

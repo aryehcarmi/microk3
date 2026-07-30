@@ -21,6 +21,7 @@ from microk3 import (
     orthogonalize,
     parameter_groups,
     sample_batch,
+    terminal_text,
 )
 
 
@@ -291,9 +292,15 @@ def test_generation_validates_inputs_and_preserves_prompt():
         model.generate(torch.tensor([[32]]), count=1)
 
 
-def test_unknown_device_is_an_argument_error_not_a_traceback():
+@pytest.mark.parametrize("device", ["bogus", "xpu", "meta"])
+def test_unsupported_device_is_an_argument_error_not_a_traceback(device):
     with pytest.raises(argparse.ArgumentTypeError):
-        available_device("bogus")
+        available_device(device)
+
+
+def test_terminal_text_escapes_control_sequences():
+    payload = b"sample\n\t\x1b]0;changed\x07\x7f\xc2\x85"
+    assert terminal_text(payload) == "sample\n\t\\x1b]0;changed\\x07\\x7f\\x85"
 
 
 def cli(monkeypatch, *arguments: str) -> None:

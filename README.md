@@ -43,7 +43,15 @@ pytest -q
 microk3 --steps 20
 ```
 
-The test run should report `31 passed`. The first training loss should be near the uniform
+On CPU-only Linux, replace the install line with the following so pip does not pull the much
+larger CUDA build of PyTorch:
+
+```bash
+pip install 'torch>=2.4,<3' --index-url https://download.pytorch.org/whl/cpu
+pip install -e '.[dev]'
+```
+
+The test run should report `34 passed`. The first training loss should be near the uniform
 byte-token baseline `ln(256) ≈ 5.55`; an initial loss in the tens or hundreds is a bug, not a
 learning challenge. Twenty steps is enough to watch that number fall and nothing more—the sample
 printed at the end is still byte noise, and stays noise until a few hundred steps on a real corpus.
@@ -143,8 +151,8 @@ depth sources                  embedding + one contribution per completed layer
 ## Model archaeology without a 1.5 TB accident
 
 Moonshot AI announced K3 on July 16, 2026; the public repository and technical report followed on
-July 27. The metadata helper lists remote filenames and performs HEAD requests for weight sizes;
-it has no file-download call and writes nothing:
+July 27. The metadata helper lists remote filenames and performs unauthenticated HEAD requests for
+weight sizes; it has no file-download call and writes nothing:
 
 ```bash
 pip install -e '.[inspect]'
@@ -169,9 +177,11 @@ modal run modal_train.py --steps 500
 
 It defaults to an L40S and the bundled corpus. `--batch-size`, `--block-size`, and `--optimizer`
 pass through, and `--data path/to/tiny.txt` ships a corpus of up to 8 MiB with the run; anything
-larger belongs in a Modal Volume. Start at 100–500 steps, inspect Modal's live cost dashboard,
-then scale consciously. **A free-credit balance is not a spending guarantee**; pricing and
-availability change, so check Modal before launching. The K3 weights are never fetched.
+larger belongs in a Modal Volume. Cloud runs default to `--generate 0`; opt in with
+`--generate 120` only when the corpus is non-sensitive and you want sampled text in the run logs.
+Do not upload private or confidential corpora. Start at 100–500 steps, inspect Modal's live cost
+dashboard, then scale consciously. **A free-credit balance is not a spending guarantee**; pricing
+and availability change, so check Modal before launching. The K3 weights are never fetched.
 
 ## Experiments worth trying
 

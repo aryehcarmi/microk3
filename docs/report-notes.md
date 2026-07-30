@@ -76,8 +76,8 @@ The official weight repository is `moonshotai/Kimi-K3`. On 2026-07-28 UTC,
 whose HEAD metadata summed to 1.420 TiB. It downloaded no file bodies.
 
 Those counts are a dated observation, not an architectural constant. The helper lists the current
-repository, performs a HEAD metadata request only for recognized weight suffixes, and has no
-download call. Readers can inspect its short source before running it:
+repository, performs an unauthenticated HEAD metadata request only for recognized weight suffixes,
+and has no download call. Readers can inspect its short source before running it:
 
 ```bash
 pip install -e '.[inspect]'
