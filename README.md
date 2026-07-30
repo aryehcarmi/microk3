@@ -4,6 +4,7 @@
   <p>
     <a href="#five-minute-tour">Five-minute tour</a> ·
     <a href="#what-is-faithful">Honesty map</a> ·
+    <a href="#pictures-and-four-bit-experts">Pictures and four-bit experts</a> ·
     <a href="#report-to-code-map">Report → code</a> ·
     <a href="#modal">Modal</a> ·
     <a href="docs/report-notes.md">Source notes</a>
@@ -25,7 +26,9 @@
 Kimi K3 combines four ideas: recurrent **Kimi Delta Attention**, periodic global
 attention, **Attention Residuals** across depth, and a **Stable LatentMoE** across width. The
 official implementation needs industrial infrastructure. This repository turns the conceptual
-spine into one hackable file, one diagram, and a small regression suite.
+spine into one hackable file, one diagram, and a small regression suite. Two further pieces of the
+release—the MoonViT-V2 vision tower and MXFP4 deployment precision—are here too, at the same
+teaching scale and behind their own flags.
 
 ![microK3 on one page: the forward pass over a depth bus, the KDA recurrence, the depth-attention
 pattern, Stable LatentMoE routing, decoding memory, the optimizer split, and the scale gap to Kimi
@@ -43,7 +46,7 @@ pytest -q
 microk3 --steps 20
 ```
 
-The test run should report `31 passed`. The first training loss should be near the uniform
+The test run should report `62 passed`. The first training loss should be near the uniform
 byte-token baseline `ln(256) ≈ 5.55`; an initial loss in the tens or hundreds is a bug, not a
 learning challenge. Twenty steps is enough to watch that number fall and nothing more—the sample
 printed at the end is still byte noise, and stays noise until a few hundred steps on a real corpus.
@@ -63,8 +66,10 @@ The file must contain at least `block_size + 1` bytes—129 bytes at the default
 larger corpus is much more useful. Use `--block-size 64` for a faster CPU experiment. Training
 prints a sample at the end; it intentionally does not create a checkpoint or background job.
 Use `--generate 0` for a train-only run. Training defaults to the per-head Muon step with a warmup
-then cosine schedule; `--optimizer adamw` switches back. Run `microk3 --help` to see the batch
-size, learning rate, optimizer, prompt, temperature, and device controls.
+then cosine schedule; `--optimizer adamw` switches back. `--vision` and `--quantize` turn on the
+two optional parts described in [Pictures and four-bit experts](#pictures-and-four-bit-experts).
+Run `microk3 --help` to see the batch size, learning rate, optimizer, prompt, temperature, and
+device controls.
 
 Read [`microk3.py`](microk3.py) top to bottom. The suggested path is:
 
@@ -80,10 +85,16 @@ Read [`microk3.py`](microk3.py) top to bottom. The suggested path is:
    stays the same size forever; only the global layers' caches grow with the sequence.
 6. `orthogonalize` → `Muon` → `build_optimizers`: K3's per-head orthogonalized step for matrix
    weights, with an undecayed AdamW tail for embeddings, gains, and biases.
+7. `MXFormat` → `quantize_mx` → `mx_linear` → `pack_mxfp4`: the deployment precision, from the
+   element grid and its shared block scale to the bit layout the weights would actually ship in.
+8. `rope_2d` → `MicroMoonViT` → `prefix_targets`: patches at the image's own resolution, several
+   pictures packed into one attention pass, then projected into the byte stream as a prefix.
 
-Model shape—`layers`, `dim`, `experts`, `top_k`, `dense_layers`—is deliberately not exposed as CLI
-flags. Edit the `Config` defaults at the top of `microk3.py` so every change stays visible in the
-file you are reading.
+Model shape—`layers`, `dim`, `experts`, `top_k`, `dense_layers`, and the `vision_*` widths—is
+deliberately not exposed as CLI flags. Edit the `Config` defaults at the top of `microk3.py` so
+every change stays visible in the file you are reading. `--vision` and `--quantize` decide only
+whether a part is built and used at all; the tower's shape and the microscaling block size stay in
+`Config`.
 
 ## What is faithful?
 
@@ -104,19 +115,62 @@ file you are reading.
 | Decoding | Fused kernels; constant KDA state, compressed MLA cache | Same state-versus-cache split in a plain prefill + step loop | 🟢 pattern |
 | Context and tokens | 1,048,576 learned-token context | 128 raw bytes by default | 🟡 teaching scale |
 | Embeddings | Untied input and output embeddings | One tied byte embedding and head | 🟡 scaled down |
-| Vision | 401M-parameter MoonViT-V2 | Absent | ⚪ out of scope |
-| Native quantization | MXFP4 expert weights / MXFP8 activations with QAT | Standard PyTorch precision | ⚪ out of scope |
+| Vision | 27-layer, 401M MoonViT-V2: RMSNorm, no bias terms, trained from scratch, 2×2 pixel shuffle into an MLP projector | 2-layer tower with the same shape rules and pixel shuffle, native-resolution packing, 2D RoPE, one projection matrix; `--vision` | 🟡 small-scale form |
+| Native quantization | MXFP4 routed-expert weights, MXFP8 input activations, QAT across post-training | Same formats, block scales and placement, straight-through QAT from step one, simulated in float32; `--quantize` | 🟡 same formats, simulated |
 
 The KDA path deliberately omits ShortConv, Swish projections, low-rank decay projection, and the
 chunkwise fused algorithm. The global layer is not MLA. Quantile Balancing is exact only over the
-local teaching batch, not a distributed global histogram. These boundaries are explicit; tests
-cover the recurrence’s numerical behavior, causality, cached-decoding equivalence, routing counts,
-next-step bias update, optimizer parameter grouping, initialization scale, valid configuration,
-generation guardrails, and corpus-window boundaries.
+local teaching batch, not a distributed global histogram. The vision tower reads small procedural
+pictures rather than photographs and has no temporal path, so video is still absent. Quantization
+is simulated in float32 instead of executed by a low-precision kernel: the arithmetic is the
+format's, the speed is not. These boundaries are explicit; tests cover the recurrence’s numerical
+behavior, causality, cached-decoding equivalence, routing counts, next-step bias update, optimizer
+parameter grouping, initialization scale, valid configuration, generation guardrails,
+corpus-window boundaries, packed multi-resolution encoding, image-prefix alignment, and the
+microscaling grid down to its tie-breaking rule and packed bit layout.
 
 One subtle experiment: with `top_k=1`, the normalized selected router weight is exactly one, so the
 router receives essentially no gradient through mixture weights. K3 uses top-16. Treat top-1 here
 as a demonstration of that failure mode, not as a recommended setting.
+
+## Pictures and four-bit experts
+
+The last two rows of that table used to read “out of scope.” Both now have a small-scale version,
+and both are off by default:
+
+```bash
+microk3 --vision --steps 500      # train the patch tower to name shapes
+microk3 --quantize --steps 200    # MXFP4 routed experts, MXFP8 input activations
+```
+
+`--vision` builds `MicroMoonViT`: patches at each image's own resolution, 2D RoPE over patch
+coordinates, and a block-diagonal mask so several differently sized pictures share one packed
+attention pass—the report's intra-frame spatial pass, with one frame per sample. A 2×2 pixel
+shuffle then folds four patches into one token before a single projection into the byte stream,
+which is where the token count actually gets paid for: a 40-pixel picture costs 100 patches but
+only 25 tokens. Those tokens are a prefix of the byte sequence and ride the same depth bus, KDA
+states, and global caches as text, so there is one backbone and no alignment stage. Training draws
+squares, circles, triangles, and crosses at 24, 32, or 40 pixels and asks for the name; the last
+image token predicts the caption's first byte, so nothing but the picture chooses the word. At the
+default seed, 500 steps reads 7 of 8 freshly drawn pictures correctly. That is the whole claim—the
+mechanism works at a scale where you can watch it, not that this tower sees anything.
+
+`--quantize` puts the deployment precision in the training loop. MXFP4 keeps each weight as an
+E2M1 element with one E8M0 power-of-two scale shared by a block of 32; MXFP8 does the same with
+E4M3 elements for the input activations. Rounding is the format's round-half-to-even, so exact
+midpoints land on even codes; `pack_mxfp4` writes the real bit layout, two 4-bit codes per byte
+plus one exponent byte per block, and `unpack_mxfp4` returns exactly what training saw. A
+straight-through estimator keeps the gradient path intact, so the weights learn where the grid is
+rather than being rounded onto it afterwards. Only the routed experts quantize—the router, the
+latent projections, the shared expert, and every attention matrix stay in float, as §4.1.4
+describes. At the default shape that covers 884,736 of 1,645,496 weights, which pack into 470,016
+bytes against 3,538,944 in float32: 4.25 bits per weight, and a reminder that experts are where
+the memory lives.
+
+Four-bit experts cost little at this size. Two hundred steps on the bundled corpus at the default
+seed end at loss 0.047 with `--quantize` and 0.041 without. Read that as a smoke test rather than
+a scaling result: the bundled corpus is short enough to memorize, and a model this small has few
+weights whose precision is doing real work.
 
 ## Report-to-code map
 
@@ -127,7 +181,9 @@ as a demonstration of that failure mode, not as a recommended setting.
 | §2.2, Eqs. 8–10 | `MicroK3._mix_depth` and `Block.forward` | Learned pseudo-query, normalized keys, softmax over prior contributions | Block grouping and intra-block partial sums |
 | §2.3, Eqs. 11–12 | `StableLatentMoE` and `SiTUGLU` | Latent routed path, pre-up RMSNorm, bounded GLU, shared path | Report-scale widths and second shared expert |
 | §2.3.3, Eqs. 13–14 | `StableLatentMoE._update_router_bias` | Bias only affects dispatch; quantile bias is used on the next pass | Distributed histogram approximation |
+| §2.4 | `MicroMoonViT`, `prefix_targets`, and `forward`'s `prefix` | Native-resolution patches, RMSNorm, bias-free projections, 2×2 pixel shuffle, one shared backbone trained by next-token prediction | Video, temporal attention and pooling, the MLP projector, 27-layer scale |
 | §2.5 and §3.3 | `orthogonalize`, `Muon`, `build_optimizers` | Per-head Newton–Schulz step, matrix/tail split, 1% warmup + cosine shape | QK-clip, distributed sharding, report-scale tuning |
+| §4.1.4 | `quantize_mx`, `mx_linear`, `pack_mxfp4` | E2M1 and E4M3 element grids, E8M0 block scales, routed-experts-only placement, QAT with a straight-through estimator | Low-precision kernels, the post-training-only schedule, RL rollout sharing |
 
 Default tensor shapes make the scale reduction concrete:
 
@@ -167,9 +223,9 @@ modal setup
 modal run modal_train.py --steps 500
 ```
 
-It defaults to an L40S and the bundled corpus. `--batch-size`, `--block-size`, and `--optimizer`
-pass through, and `--data path/to/tiny.txt` ships a corpus of up to 8 MiB with the run; anything
-larger belongs in a Modal Volume. Start at 100–500 steps, inspect Modal's live cost dashboard,
+It defaults to an L40S and the bundled corpus. `--batch-size`, `--block-size`, `--optimizer`,
+`--vision`, and `--quantize` pass through, and `--data path/to/tiny.txt` ships a corpus of up to
+8 MiB with the run; anything larger belongs in a Modal Volume. Start at 100–500 steps, inspect Modal's live cost dashboard,
 then scale consciously. **A free-credit balance is not a spending guarantee**; pricing and
 availability change, so check Modal before launching. The K3 weights are never fetched.
 
@@ -189,6 +245,14 @@ availability change, so check Modal before launching. The K3 weights are never f
 - Generate far past `--block-size` and watch the global caches grow while every KDA state stays
   the same size.
 - Compress the global layers' plain KV cache into a small latent, as MLA does, and measure memory.
+- K3 turns quantization on for post-training only. Flip `cfg.mx_qat` partway through a run instead
+  of at step zero, and watch how much loss the switch costs when the weights were not expecting it.
+- Point `mx_linear` at the shared expert or the attention projections too. The report leaves them
+  in higher precision; the loss curve shows why that is not just caution.
+- Delete the pixel shuffle and project each patch on its own. The captions barely change, and the
+  prefix gets four times longer—which at 1M tokens is the entire argument for it.
+- Feed the tower two resolutions in one call and compare against encoding each alone. They match,
+  because the packed mask is the only thing keeping images apart.
 
 ## Development
 

@@ -15,7 +15,15 @@ image = (
 
 
 @app.function(image=image, gpu="L40S", timeout=30 * 60)
-def train(steps: int, batch_size: int, block_size: int, optimizer: str, data: bytes | None):
+def train(
+    steps: int,
+    batch_size: int,
+    block_size: int,
+    optimizer: str,
+    data: bytes | None,
+    vision: bool = False,
+    quantize: bool = False,
+):
     import subprocess
 
     if not 1 <= steps <= 10_000:
@@ -23,7 +31,9 @@ def train(steps: int, batch_size: int, block_size: int, optimizer: str, data: by
     command = ["python", "/root/microk3.py", "--device", "cuda", "--steps", str(steps)]
     command += ["--batch-size", str(batch_size), "--block-size", str(block_size)]
     command += ["--optimizer", optimizer]
-    if data:
+    command += ["--vision"] if vision else []
+    command += ["--quantize"] if quantize else []
+    if data and not vision:  # the shapes task draws its own pictures
         Path("/root/corpus.bin").write_bytes(data)
         command += ["--data", "/root/corpus.bin"]
     subprocess.run(command, check=True)
@@ -36,9 +46,11 @@ def main(
     block_size: int = 128,
     optimizer: str = "muon",
     data: str = "",
+    vision: bool = False,
+    quantize: bool = False,
 ):
     """Ship a small corpus with the run; anything larger belongs in a Modal Volume."""
     payload = Path(data).read_bytes() if data else None
     if payload is not None and len(payload) > MAX_CORPUS_BYTES:
         raise ValueError(f"corpus must be at most {MAX_CORPUS_BYTES:,} bytes, got {len(payload):,}")
-    train.remote(steps, batch_size, block_size, optimizer, payload)
+    train.remote(steps, batch_size, block_size, optimizer, payload, vision, quantize)
