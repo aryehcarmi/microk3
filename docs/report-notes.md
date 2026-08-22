@@ -1,6 +1,6 @@
-# Reading Kimi K3 without hand-waving
+# Kimi K3 source notes
 
-These notes separate **reported fact**, **microK3's implementation choice**, and **unknown**.
+These notes separate reported fact, microK3's implementation choices, and unknowns.
 Primary sources are Moonshot AI's [Kimi K3 repository](https://github.com/MoonshotAI/Kimi-K3),
 [technical report](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf), released
 weights [configuration](https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json), and
@@ -41,8 +41,8 @@ They were checked on 2026-07-28 UTC.
   encoder output into the LLM, keeping inputs up to 3,584×3,584 pixels affordable. Text, images,
   and video share one backbone and one context, with no post-hoc modality-alignment stage.
 - §4.1.4: MoE expert weights are quantized to MXFP4 with activations computed in MXFP8, while all
-  non-expert components—attention projections, latent MoE projections, shared experts, and MoE
-  routers—stay in higher precision. Quantization-aware training runs throughout post-training,
+  non-expert components (attention projections, latent MoE projections, shared experts, and MoE
+  routers) stay in higher precision. Quantization-aware training runs throughout post-training,
   covering both SFT and RL, and rollout and training share the scheme during RL. This is not
   post-training quantization of the whole model.
 - The element and scale formats themselves are not defined in the K3 report; it cites
@@ -100,8 +100,8 @@ varying resolutions, so packing images into one sequence behind a block-diagonal
 over patch coordinates, are implementation choices here. Both come from the earlier MoonViT as
 described in the [Kimi-VL report](https://arxiv.org/abs/2504.07491), which flattens patches into 1D
 sequences in NaViT's style and applies 2D RoPE across height and width. Whether V2 keeps either
-mechanism is unknown from these sources. What the K3 report does state—one shared backbone,
-per-image resolution up to 3,584×3,584, and an intra-frame spatial attention pass—is what the
+mechanism is unknown from these sources. What the K3 report does state (one shared backbone,
+per-image resolution up to 3,584×3,584, and an intra-frame spatial attention pass) is what the
 block-diagonal mask is built to satisfy.
 
 ## Weight inspection status

@@ -103,8 +103,8 @@ class RMSNorm(nn.Module):
 class LayerCache:
     """One layer's decoding memory: a KDA recurrent state or a global-attention history.
 
-    KDA's ``state`` stays the same size forever; only the global layers grow with the
-    prompt. That asymmetry is the whole point of a 3:1 hybrid, so it is worth watching.
+    KDA's ``state`` stays the same size forever; only the global layers' key/value
+    histories grow with the prompt.
     """
 
     state: torch.Tensor | None = None
@@ -120,7 +120,7 @@ def delta_rule_step(
     alpha: torch.Tensor,
     beta: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply one readable KDA recurrence step from report Eq. 1."""
+    """One KDA recurrence step, following report Eq. 1."""
     decayed = alpha * state
     prediction = torch.einsum("bhij,bhi->bhj", decayed, key)
     error = value - prediction
@@ -131,10 +131,10 @@ def delta_rule_step(
 
 
 class KimiDeltaAttention(nn.Module):
-    """Transparent recurrent form of K3's channel-wise delta rule.
+    """Recurrent form of K3's channel-wise delta rule.
 
-    The report uses ShortConv + Swish projections and a fused chunkwise kernel.
-    We keep plain projections and an intentionally slow, legible token loop.
+    The report uses ShortConv + Swish projections and a fused chunkwise kernel;
+    this version uses plain projections and a sequential token loop.
     """
 
     def __init__(self, cfg: Config):
@@ -206,9 +206,9 @@ class GatedAttention(nn.Module):
 class MXFormat:
     """One OCP microscaling element format (arXiv:2310.10537).
 
-    A microscaling block is two things: tiny elements, and a single power-of-two scale that
-    a run of them share along the reduction axis. ``mantissa_bits`` and ``min_exponent``
-    are all it takes to describe the element grid.
+    A microscaling block pairs low-precision elements with a single power-of-two scale
+    shared along the reduction axis. ``mantissa_bits`` and ``min_exponent`` fully
+    describe the element grid.
     """
 
     name: str
@@ -225,7 +225,7 @@ class MXFormat:
 
 MXFP4 = MXFormat("MXFP4", bits=4, mantissa_bits=1, min_exponent=0, largest=6.0)  # E2M1 elements
 MXFP8 = MXFormat("MXFP8", bits=8, mantissa_bits=3, min_exponent=-6, largest=448.0)  # E4M3 elements
-# The eight E2M1 magnitudes in code order: the index is literally the element's low three bits.
+# The eight E2M1 magnitudes, indexed by the element's low three bits.
 MXFP4_CODES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
@@ -242,7 +242,7 @@ def mx_shared_scale(blocks: torch.Tensor, fmt: MXFormat) -> torch.Tensor:
     """One E8M0 scale per block: the power of two that lifts the block maximum to ``emax``."""
     largest = blocks.abs().amax(-1, keepdim=True)
     exponent = torch.floor(torch.log2(largest.clamp_min(torch.finfo(blocks.dtype).smallest_normal)))
-    # E8M0 carries an exponent and nothing else—no mantissa, no sign, range -127..127.
+    # E8M0 carries only an exponent: no mantissa, no sign, range -127..127.
     return torch.exp2((exponent - fmt.emax).clamp(-127, 127))
 
 
@@ -250,8 +250,8 @@ def quantize_elements(x: torch.Tensor, fmt: MXFormat) -> torch.Tensor:
     """Round already-scaled elements onto ``fmt``'s grid, then clamp instead of overflowing."""
     exponent = torch.floor(torch.log2(x.abs().clamp_min(torch.finfo(x.dtype).smallest_normal)))
     step = torch.exp2(exponent.clamp_min(fmt.min_exponent) - fmt.mantissa_bits)
-    # torch.round is round-half-to-even, which is the tie rule the format asks for. The clamp
-    # matters: a block maximum in [448, 512) scales past E4M3's reach and saturates there.
+    # torch.round is round-half-to-even, the tie rule the format specifies. The clamp is
+    # needed because a block maximum in [448, 512) scales past E4M3's range and saturates.
     return (x / step).round().mul(step).clamp(-fmt.largest, fmt.largest)
 
 
@@ -276,7 +276,7 @@ def mx_linear(layer: nn.Linear, x: torch.Tensor, block: int) -> torch.Tensor:
 
 
 def pack_mxfp4(x: torch.Tensor, block: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Store ``x`` for real: two E2M1 codes per byte, plus one E8M0 exponent byte per block."""
+    """Pack ``x`` into MXFP4 storage: two E2M1 codes per byte, one E8M0 exponent byte per block."""
     blocks = mx_split(x.detach().float(), block)
     scale = mx_shared_scale(blocks, MXFP4)
     elements = quantize_elements(blocks / scale, MXFP4)
@@ -368,8 +368,8 @@ class StableLatentMoE(nn.Module):
         weights = scores * mask
         weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-9)
         z = self.down(x)
-        # K3 dispatches tokens to their Top-k experts; we run every expert densely and mask
-        # afterwards, which is the same function and much easier to read (and much slower).
+        # K3 dispatches tokens to their Top-k experts; here every expert runs densely and
+        # is masked afterwards. Same function, simpler code, much slower.
         routed = sum(weights[..., i, None] * expert(z) for i, expert in enumerate(self.experts))
         self.last_load = mask.detach().sum((0, 1))
         if self.training and cutoff is not None:
@@ -396,8 +396,7 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 class VisionBlock(nn.Module):
     """One patch-transformer layer: bidirectional attention with 2D RoPE, then a bounded GLU.
 
-    MoonViT-V2 uses RMSNorm and drops every bias term, which is what stabilizes training a
-    vision tower from scratch; both choices carry over here unchanged.
+    MoonViT-V2 uses RMSNorm and drops every bias term; both choices carry over here.
     """
 
     def __init__(self, cfg: Config):
@@ -425,11 +424,11 @@ class VisionBlock(nn.Module):
 class MicroMoonViT(nn.Module):
     """Native-resolution patch tower, trained from scratch by next-byte prediction.
 
-    Each image keeps its own patch grid, and a batch of differently sized images travels as
-    one packed sequence whose block-diagonal mask holds attention inside a single image—the
-    report's intra-frame spatial pass, with one frame per sample. K3 then pixel-shuffles 2x2
-    patch groups before an MLP projector; microK3 shuffles the same way into one bias-free
-    matrix. Video, temporal attention, and temporal pooling are absent.
+    Each image keeps its own patch grid; a batch of differently sized images travels as
+    one packed sequence whose block-diagonal mask holds attention inside a single image
+    (the report's intra-frame spatial pass, one frame per sample). K3 pixel-shuffles 2x2
+    patch groups before an MLP projector; microK3 shuffles the same way into one
+    bias-free matrix. Video, temporal attention, and temporal pooling are absent.
     """
 
     def __init__(self, cfg: Config):
@@ -515,8 +514,8 @@ class MicroK3(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.token = nn.Embedding(cfg.vocab_size, cfg.dim)
-        # Native vision: one shared backbone, so patch tokens join the byte stream as a
-        # prefix rather than passing through a second model or an alignment stage.
+        # One shared backbone: patch tokens join the byte stream as a prefix rather
+        # than passing through a second model or an alignment stage.
         self.vision = MicroMoonViT(cfg) if cfg.vision_layers else None
         # K3 repeats 3 KDA : 1 global attention and always ends globally.
         self.blocks = nn.ModuleList(
@@ -654,9 +653,9 @@ class Muon(torch.optim.Optimizer):
     """Per-head Muon: momentum, then an orthogonalized step for each head's own slice.
 
     K3 trains matrices with Per-Head Muon and everything else with AdamW. ``blocks`` is
-    how many head-sized row groups a weight holds—fused Q/K/V holds three per head—so the
-    Newton-Schulz iteration runs batched over heads rather than over the whole matrix.
-    QK-clip, the other half of K3's optimizer, is not reproduced here.
+    how many head-sized row groups a weight holds (fused Q/K/V holds three per head), so
+    the Newton-Schulz iteration runs batched over heads rather than over the whole
+    matrix. QK-clip, the other half of K3's optimizer, is not reproduced here.
     """
 
     def __init__(self, groups, lr: float = 0.02, momentum: float = 0.95, weight_decay: float = 0.0):
@@ -681,7 +680,7 @@ class Muon(torch.optim.Optimizer):
 
 
 def parameter_groups(model: MicroK3) -> tuple[dict[int, list[nn.Parameter]], list[nn.Parameter]]:
-    """Sort weights into head-aligned matrix groups and the scalar-ish remainder."""
+    """Sort weights into head-aligned matrix groups and the embedding/gain/bias remainder."""
     matrices: dict[int, list[nn.Parameter]] = {}
     others: list[nn.Parameter] = []
     for name, parameter in model.named_parameters():
@@ -775,8 +774,8 @@ def shapes_batch(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """A batch of shape pictures with their byte captions and supervised caption lengths.
 
-    One resolution per batch keeps the projected prefix rectangular. The tower itself packs
-    mixed resolutions in a single pass; only this rectangular hand-off asks them to agree.
+    One resolution per batch keeps the projected prefix rectangular. The tower itself
+    packs mixed resolutions in a single pass; only this hand-off needs them to match.
     """
     if batch_size <= 0 or size <= 0:
         raise ValueError("batch_size and size must be positive")
@@ -793,8 +792,8 @@ def shapes_batch(
 def prefix_targets(tokens: torch.Tensor, lengths: torch.Tensor, prefix_len: int) -> torch.Tensor:
     """Line targets up so the last image token predicts the caption's first byte.
 
-    Positions with nothing to predict—every image token but the last, and padding past each
-    caption—carry -100, which cross entropy ignores.
+    Positions with nothing to predict (every image token but the last, and padding past
+    each caption) carry -100, which cross entropy ignores.
     """
     if prefix_len < 1:
         raise ValueError(f"prefix_len must be at least 1, got {prefix_len}")
@@ -806,7 +805,7 @@ def prefix_targets(tokens: torch.Tensor, lengths: torch.Tensor, prefix_len: int)
 
 
 def caption(model: MicroK3, images: torch.Tensor, count: int, temperature: float) -> list[str]:
-    """Read each picture with nothing else in context: the image is the entire prompt."""
+    """Caption each picture with nothing else in context: the image is the entire prompt."""
     prefix = torch.stack(model.encode_images(images))
     empty = torch.zeros(len(images), 0, dtype=torch.long, device=prefix.device)
     sampled = model.generate(empty, count, temperature, prefix=prefix)
@@ -854,10 +853,6 @@ def positive_float(value: str) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be finite and positive")
     return parsed
-
-
-def styled(text: str, color: int) -> str:
-    return f"\033[38;5;{color}m{text}\033[0m" if sys.stdout.isatty() else text
 
 
 def terminal_text(data: bytes) -> str:
@@ -943,21 +938,21 @@ def main() -> None:
     count = sum(parameter.numel() for parameter in model.parameters())
     python_version = ".".join(map(str, sys.version_info[:3]))
     print(
-        f"{styled('◆ microK3', 81)}  {count:,} parameters  {args.device}  "
+        f"microK3  {count:,} parameters  {args.device}  "
         f"python {python_version}  torch {torch.__version__}  seed {args.seed}  "
         f"block {cfg.block_size}  batch {args.batch_size}  {args.optimizer}"
     )
     if cfg.vision_layers:
         tokens_per_image = "/".join(str((size // cfg.patch_size // 2) ** 2) for size in SHAPE_SIZES)
         print(
-            f"{styled('◇ vision', 81)}  {cfg.vision_layers}-layer tower  patch {cfg.patch_size}  "
+            f"vision  {cfg.vision_layers}-layer tower  patch {cfg.patch_size}  "
             f"{'/'.join(map(str, SHAPE_SIZES))} px  {tokens_per_image} tokens per image after pixel shuffle"
         )
     if cfg.mx_qat:
         quantized, stored = mxfp4_footprint(model)
         bits = MXFP4.bits + 8 / cfg.mx_block
         print(
-            f"{styled('◇ MX-QAT', 81)}  {MXFP4.name} weights, {MXFP8.name} activations  "
+            f"MX-QAT  {MXFP4.name} weights, {MXFP8.name} activations  "
             f"block {cfg.mx_block}  {bits:.2f} bits per routed weight  {quantized:,} weights  "
             f"{stored:,} B packed against {4 * quantized:,} B in float32"
         )
@@ -981,7 +976,7 @@ def main() -> None:
             optimizer.step()
             schedule.step()
         if step % 10 == 0 or step == args.steps - 1:
-            print(f"{styled(f'step {step:04d}', 213)}  loss {loss.item():.4f}")
+            print(f"step {step:04d}  loss {loss.item():.4f}")
     model.eval()
     if args.generate and cfg.vision_layers:
         images, x, lengths = shapes_batch(8, SHAPE_SIZES[-1], args.device)
@@ -990,9 +985,9 @@ def main() -> None:
         ]
         read = caption(model, images, max(map(len, SHAPES)) + 1, args.temperature)
         correct = sum(want == got for want, got in zip(wanted, read, strict=True))
-        print(f"\n{styled(f'{correct}/{len(wanted)} pictures read', 213)}  at {SHAPE_SIZES[-1]} px")
+        print(f"\n{correct}/{len(wanted)} pictures read at {SHAPE_SIZES[-1]} px")
         for want, got in zip(wanted, read, strict=True):
-            print(f"  {want:<8} → {got!r}")
+            print(f"  {want:<8} -> {got!r}")
     elif args.generate:
         seed = torch.tensor([list(prompt)], dtype=torch.long, device=args.device)
         sample = model.generate(seed, args.generate, args.temperature)[0].cpu().tolist()

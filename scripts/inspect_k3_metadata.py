@@ -24,12 +24,12 @@ def main() -> None:
             total += size
             print(f"WEIGHT  {size / 2**30:8.2f} GiB  {name}")
         else:
-            print(f"CONTROL {'—':>8}      {name}")
+            print(f"CONTROL {'-':>8}      {name}")
     print(f"\nRecognized weight files: {weight_count}")
     print(f"Known remote weight total from HEAD metadata: {total / 2**40:.3f} TiB")
     if unknown_sizes:
         print(f"Files with unknown sizes: {len(unknown_sizes)}")
-    print("Downloaded file bodies: 0 bytes. This script has no file-download call.")
+    print("Downloaded file bodies: 0 bytes.")
 
 
 if __name__ == "__main__":

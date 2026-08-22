@@ -227,7 +227,7 @@ def test_quantile_balancing_updates_next_step_bias_only_during_training():
 
 
 def test_router_bias_steers_dispatch_but_never_mixture_weights():
-    """The whole point of aux-loss-free balancing: bias picks experts, scores weight them."""
+    """Bias affects only which experts are picked; mixture weights come from unbiased scores."""
     torch.manual_seed(0)
     moe = StableLatentMoE(tiny_config()).eval()
     x = torch.randn(2, 4, 16)
@@ -290,7 +290,7 @@ def test_mx_grid_values_survive_quantization_exactly():
 
 
 def test_mxfp4_rounds_halfway_magnitudes_to_even_codes():
-    """The tie rule: a midpoint lands on the even code, which is not rounding away from zero."""
+    """A halfway magnitude lands on the even code, not away from zero."""
     block = torch.tensor([[6.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]])
     expected = torch.tensor([[6.0, 0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]])
     torch.testing.assert_close(quantize_mx(block, MXFP4, block=8), expected)
@@ -300,7 +300,7 @@ def test_mx_shared_scale_is_one_power_of_two_per_block():
     blocks = torch.tensor([[[1.0, 0.5], [1000.0, 0.001]]])
     scale = mx_shared_scale(blocks, MXFP4)
     torch.testing.assert_close(torch.log2(scale).flatten(), torch.tensor([-2.0, 7.0]))
-    # A loud block cannot spend the quiet block's precision: 0.5 stays exact next door.
+    # Blocks scale independently: the small block's 0.5 stays exact beside a large block.
     torch.testing.assert_close(quantize_mx(blocks.flatten(), MXFP4, block=2)[:2], blocks.flatten()[:2])
 
 
@@ -357,7 +357,7 @@ def test_quantization_moves_the_routed_output_but_not_the_shared_path():
 
 
 def test_quantized_model_overfits_one_batch():
-    """Four-bit expert weights still learn, because the estimator keeps the gradient path real."""
+    """The straight-through estimator keeps four-bit expert weights trainable."""
     torch.manual_seed(0)
     model = MicroK3(tiny_config(mx_qat=True))
     x = torch.randint(0, 32, (2, 8))
@@ -400,7 +400,7 @@ def test_patchify_and_pixel_shuffle_keep_the_picture_in_order():
     """Each patch holds its own pixels, and one shuffled token holds a 2x2 patch neighbourhood."""
     model = MicroK3(tiny_vision_config(dim=64))
     tower = model.vision
-    with torch.no_grad():  # identity weights, so tokens are literally the pixels they cover
+    with torch.no_grad():  # identity weights make each token exactly the pixels it covers
         tower.embed.weight.copy_(torch.eye(16))
         tower.project.weight.copy_(torch.eye(64))
     patches, rows, columns = tower.patchify(torch.arange(64.0).reshape(1, 8, 8))
