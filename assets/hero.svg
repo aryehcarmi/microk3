@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+<title id="title">microK3</title>
+<desc id="desc">Frontier ideas at laptop scale: delta attention, depth attention, and routed experts combined in a readable teaching model.</desc>
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#090b2b"/><stop offset=".48" stop-color="#32156b"/><stop offset="1" stop-color="#073b4c"/></linearGradient><radialGradient id="orb"><stop stop-color="#5ee7ff" stop-opacity=".9"/><stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/></radialGradient><filter id="glow"><feGaussianBlur stdDeviation="10" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+<rect width="1200" height="360" rx="28" fill="url(#bg)"/><circle cx="1020" cy="60" r="220" fill="url(#orb)"/><circle cx="120" cy="330" r="180" fill="url(#orb)" opacity=".5"/>
+<g opacity=".22" stroke="#7dd3fc"><path d="M0 80h1200M0 160h1200M0 240h1200M200 0v360M400 0v360M600 0v360M800 0v360M1000 0v360"/></g>
+<g transform="translate(830 92)" fill="none" stroke-width="8" filter="url(#glow)"><path stroke="#67e8f9" d="M15 90C80 5 145 175 215 90"/><path stroke="#f472b6" d="M15 125C80 40 145 210 215 125"/><circle cx="15" cy="90" r="9" fill="#67e8f9"/><circle cx="215" cy="125" r="9" fill="#f472b6"/></g>
+<text x="72" y="150" fill="#fff" font-family="ui-monospace,monospace" font-size="88" font-weight="800">micro<tspan fill="#67e8f9">K3</tspan></text>
+<text x="77" y="205" fill="#f0abfc" font-family="ui-sans-serif,sans-serif" font-size="28" letter-spacing="5">FRONTIER IDEAS · LAPTOP SCALE</text>
+<g transform="translate(76 252)" font-family="ui-monospace,monospace" font-size="18"><rect width="570" height="50" rx="25" fill="#ffffff" opacity=".1"/><text x="25" y="32" fill="#a7f3d0">DELTA</text><text x="120" y="32" fill="#fde68a">×</text><text x="150" y="32" fill="#93c5fd">DEPTH</text><text x="245" y="32" fill="#fde68a">×</text><text x="275" y="32" fill="#f9a8d4">EXPERTS</text><text x="390" y="32" fill="#fde68a">=</text><text x="420" y="32" fill="white">LEARNING</text></g>
+</svg>

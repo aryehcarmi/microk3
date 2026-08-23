@@ -1,4 +1,4 @@
-# microK3
+<img src="assets/hero.svg" width="100%" alt="microK3: frontier ideas, laptop scale">
 
 [![CI](https://github.com/aryehcarmi/microk3/actions/workflows/ci.yml/badge.svg)](https://github.com/aryehcarmi/microk3/actions/workflows/ci.yml)
 
